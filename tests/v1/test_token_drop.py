@@ -5,11 +5,22 @@ from types import SimpleNamespace
 import pytest
 
 from lmcache.integration.vllm import lmcache_mp_metadata as metadata_mod
+from lmcache.integration.vllm import token_drop
 from lmcache.integration.vllm.lmcache_mp_metadata import LMCacheMPRequestTracker
 from lmcache.integration.vllm.token_drop import (
     TokenDropSpec,
+    build_token_drop_algorithm,
     parse_token_drop_spec,
 )
+
+
+class _FakeEntryPoint:
+    def __init__(self, name, factory):
+        self.name = name
+        self._factory = factory
+
+    def load(self):
+        return self._factory
 
 
 def test_absent_token_drop_config_means_normal_request() -> None:
@@ -38,6 +49,40 @@ def test_parse_request_local_token_drop_config_is_opaque_to_lmcache() -> None:
         algorithm="rkv",
         config=config,
     )
+
+
+def test_algorithm_factory_uses_external_plugin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = {}
+
+    def factory(config):
+        seen.update(config)
+        return SimpleNamespace(name="fake")
+
+    monkeypatch.setattr(
+        token_drop,
+        "entry_points",
+        lambda *, group: [_FakeEntryPoint("fake", factory)],
+    )
+
+    algorithm = build_token_drop_algorithm(
+        TokenDropSpec(
+            algorithm="fake",
+            config={"opaque": 1},
+        )
+    )
+    assert algorithm.name == "fake"
+    assert seen == {"opaque": 1}
+
+
+def test_missing_algorithm_plugin_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(token_drop, "entry_points", lambda *, group: [])
+
+    with pytest.raises(ValueError, match="No token-drop algorithm plugin"):
+        build_token_drop_algorithm(TokenDropSpec("missing", {}))
 
 
 def test_request_tracker_records_token_drop_spec(
