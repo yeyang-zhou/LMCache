@@ -342,6 +342,27 @@ def test_normal_registration_does_not_require_token_drop_layout():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_token_drop_rejects_noncontiguous_kv_layout():
+    backing = torch.empty(
+        2,
+        2,
+        BLOCK_SIZE,
+        KV_HEADS,
+        HEAD_DIM * 2,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    noncontiguous = backing[..., ::2]
+    assert not noncontiguous.is_contiguous()
+
+    worker = TokenDropWorker()
+    worker.register_kv_caches({"layer": noncontiguous})
+
+    with pytest.raises(ValueError, match="contiguous NHD"):
+        worker._ensure_kv_caches_compatible()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_algorithm_selection_failure_propagates(monkeypatch):
     class _Rejecting(_FakeAlgorithm):
         def select_kept_positions(self, layer_keys):
