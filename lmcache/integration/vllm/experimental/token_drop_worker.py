@@ -30,8 +30,7 @@ class TokenDropWorker:
         self._request_rows: list[int] = []
         self._seq_lens: list[int] | None = None
         self._block_table: torch.Tensor | None = None
-        self._is_genuine_decode: list[bool] | None = None
-        self._num_decoded_tokens: list[int] | None = None
+        self._compact_now: list[bool] | None = None
         self._num_new_tokens: list[int] | None = None
 
         self._query_observation_indices: torch.Tensor | None = None
@@ -118,33 +117,7 @@ class TokenDropWorker:
             return
 
         self._ensure_kv_caches_compatible()
-        algorithms = [self._algorithm_from_state(state) for state in request_states]
-        observe_query = [
-            bool(
-                algorithm.should_observe_query(
-                    num_decoded_tokens=int(state.num_decoded_tokens),
-                    num_new_tokens=int(state.num_new_tokens),
-                    is_genuine_decode=bool(state.is_genuine_decode),
-                )
-            )
-            for state, algorithm in zip(request_states, algorithms, strict=True)
-        ]
-
-        attn_metadata = forward_context.attn_metadata
-        if not isinstance(attn_metadata, dict) or not attn_metadata:
-            raise ValueError("Token dropping MVP requires eager attention metadata")
-
-        representative = next(iter(attn_metadata.values()))
         ordered_states = list(request_states)
-        request_rows = [int(state.worker_row) for state in ordered_states]
-        if any(row < 0 for row in request_rows):
-            raise RuntimeError("Token-drop metadata is missing worker row identity")
-        if (
-            request_rows
-            and max(request_rows) + 1 >= representative.query_start_loc.shape[0]
-        ):
-            raise ValueError("Token-drop request/attention row mismatch")
-
         query_lens = [int(state.num_new_tokens) for state in ordered_states]
         if any(state.resident_kv_tokens is None for state in ordered_states):
             raise RuntimeError(
@@ -161,6 +134,53 @@ class TokenDropWorker:
         ):
             raise ValueError("Token dropping received invalid physical/query lengths")
 
+        algorithms = [self._algorithm_from_state(state) for state in ordered_states]
+        observe_query = [
+            bool(
+                algorithm.should_observe_query(
+                    num_decoded_tokens=int(state.num_decoded_tokens),
+                    num_new_tokens=int(state.num_new_tokens),
+                    is_genuine_decode=bool(state.is_genuine_decode),
+                )
+            )
+            for state, algorithm in zip(ordered_states, algorithms, strict=True)
+        ]
+        compact_now = [
+            bool(
+                algorithm.should_compact(
+                    resident_len=physical_len,
+                    num_decoded_tokens=int(state.num_decoded_tokens),
+                    num_new_tokens=int(state.num_new_tokens),
+                    is_genuine_decode=bool(state.is_genuine_decode),
+                )
+            )
+            for state, algorithm, physical_len in zip(
+                ordered_states,
+                algorithms,
+                physical_seq_lens,
+                strict=True,
+            )
+        ]
+
+        if not any(observe_query) and not any(compact_now):
+            self.remove_query_hooks()
+            self._clear_step()
+            return
+
+        attn_metadata = forward_context.attn_metadata
+        if not isinstance(attn_metadata, dict) or not attn_metadata:
+            raise ValueError("Token dropping MVP requires eager attention metadata")
+
+        representative = next(iter(attn_metadata.values()))
+        request_rows = [int(state.worker_row) for state in ordered_states]
+        if any(row < 0 for row in request_rows):
+            raise RuntimeError("Token-drop metadata is missing worker row identity")
+        if (
+            request_rows
+            and max(request_rows) + 1 >= representative.query_start_loc.shape[0]
+        ):
+            raise ValueError("Token-drop request/attention row mismatch")
+
         if any(observe_query):
             self.install_query_hooks(forward_context.no_compile_layers)
         else:
@@ -172,15 +192,8 @@ class TokenDropWorker:
             physical_seq_lens=physical_seq_lens,
             request_rows=request_rows,
             observe_query=observe_query,
-            is_genuine_decode=[
-                bool(state.is_genuine_decode) for state in ordered_states
-            ],
-            num_decoded_tokens=[
-                int(state.num_decoded_tokens) for state in ordered_states
-            ],
-            num_new_tokens=[
-                int(state.num_new_tokens) for state in ordered_states
-            ],
+            compact_now=compact_now,
+            num_new_tokens=query_lens,
         )
 
     def begin_step(
@@ -191,8 +204,7 @@ class TokenDropWorker:
         physical_seq_lens: list[int],
         request_rows: list[int] | None = None,
         observe_query: list[bool] | None = None,
-        is_genuine_decode: list[bool] | None = None,
-        num_decoded_tokens: list[int] | None = None,
+        compact_now: list[bool] | None = None,
         num_new_tokens: list[int] | None = None,
     ) -> None:
         self._ensure_kv_caches_compatible()
@@ -222,16 +234,6 @@ class TokenDropWorker:
         for request_id in self._request_ids:
             self._algorithm_for_request(request_id)
 
-        self._is_genuine_decode = (
-            [True] * num_reqs
-            if is_genuine_decode is None
-            else list(is_genuine_decode)
-        )
-        self._num_decoded_tokens = (
-            [0] * num_reqs
-            if num_decoded_tokens is None
-            else list(num_decoded_tokens)
-        )
         self._num_new_tokens = (
             [1] * num_reqs
             if num_new_tokens is None
@@ -240,11 +242,13 @@ class TokenDropWorker:
         observe_query = (
             [False] * num_reqs if observe_query is None else list(observe_query)
         )
+        self._compact_now = (
+            [False] * num_reqs if compact_now is None else list(compact_now)
+        )
         if (
-            len(self._is_genuine_decode) != num_reqs
-            or len(self._num_decoded_tokens) != num_reqs
-            or len(self._num_new_tokens) != num_reqs
+            len(self._num_new_tokens) != num_reqs
             or len(observe_query) != num_reqs
+            or len(self._compact_now) != num_reqs
         ):
             raise ValueError("Token-drop request/step fact count mismatch")
 
@@ -462,31 +466,29 @@ class TokenDropWorker:
         return new_resident_len
 
     def compact(self) -> dict[str, int]:
-        if self._seq_lens is None or self._block_table is None:
+        if (
+            self._seq_lens is None
+            or self._block_table is None
+            or self._compact_now is None
+        ):
             return {}
 
-        assert self._is_genuine_decode is not None
-        assert self._num_decoded_tokens is not None
-        assert self._num_new_tokens is not None
-
         updates: dict[str, int] = {}
-        for local_row, (request_id, worker_row) in enumerate(
-            zip(self._request_ids, self._request_rows, strict=True)
+        for local_row, (request_id, worker_row, compact_now) in enumerate(
+            zip(
+                self._request_ids,
+                self._request_rows,
+                self._compact_now,
+                strict=True,
+            )
         ):
-            algorithm = self._algorithm_for_request(request_id)
-            seq_len = self._seq_lens[local_row]
-            if not algorithm.should_compact(
-                resident_len=seq_len,
-                num_decoded_tokens=self._num_decoded_tokens[local_row],
-                num_new_tokens=self._num_new_tokens[local_row],
-                is_genuine_decode=self._is_genuine_decode[local_row],
-            ):
+            if not compact_now:
                 continue
 
             updates[request_id] = self._compact_request(
                 worker_row,
-                seq_len,
-                algorithm,
+                self._seq_lens[local_row],
+                self._algorithm_for_request(request_id),
             )
 
         return updates
@@ -498,6 +500,5 @@ class TokenDropWorker:
         self._query_observation_slices = []
         self._seq_lens = None
         self._block_table = None
-        self._is_genuine_decode = None
-        self._num_decoded_tokens = None
+        self._compact_now = None
         self._num_new_tokens = None

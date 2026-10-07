@@ -137,8 +137,7 @@ def test_query_observation_forwards_full_request_step_even_for_prefill(monkeypat
         physical_seq_lens=[7],
         request_rows=[1],
         observe_query=[True],
-        is_genuine_decode=[False],
-        num_decoded_tokens=[0],
+        compact_now=[False],
         num_new_tokens=[3],
     )
 
@@ -153,6 +152,29 @@ def test_query_observation_forwards_full_request_step_even_for_prefill(monkeypat
     for name in LAYER_NAMES:
         assert len(algorithm.observations[name]) == 1
         assert torch.equal(algorithm.observations[name][0], query[2:5])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_idle_step_skips_attention_metadata_and_worker_state(monkeypatch):
+    algorithm = _FakeAlgorithm(observe=False, compact=False)
+    _install_algorithms(monkeypatch, {"a": algorithm})
+
+    worker = TokenDropWorker()
+    worker.register_kv_caches(_new_cache(4))
+    state = _state("td", "a", resident=8, worker_row=0)
+    forward_context = SimpleNamespace(
+        attn_metadata=None,
+        no_compile_layers={},
+    )
+
+    worker.prepare_forward(forward_context, [state])
+
+    assert worker._query_hooks_installed is False
+    assert worker._seq_lens is None
+    assert worker._compact_now is None
+    assert worker.compact() == {}
+    assert len(algorithm.observe_calls) == 1
+    assert len(algorithm.compact_calls) == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -196,8 +218,7 @@ def test_compaction_applies_algorithm_positions_on_cuda(monkeypatch, dtype):
         _metadata([block_ids], [1]),
         physical_seq_lens=[8],
         observe_query=[False],
-        is_genuine_decode=[True],
-        num_decoded_tokens=[1],
+        compact_now=[True],
         num_new_tokens=[1],
     )
 
@@ -229,8 +250,7 @@ def test_repeated_compaction_uses_current_physical_sequence(monkeypatch):
         _metadata([block_ids], [1]),
         physical_seq_lens=[8],
         observe_query=[False],
-        is_genuine_decode=[True],
-        num_decoded_tokens=[1],
+        compact_now=[True],
         num_new_tokens=[1],
     )
     assert worker.compact() == {"td": 4}
@@ -241,8 +261,7 @@ def test_repeated_compaction_uses_current_physical_sequence(monkeypatch):
         _metadata([block_ids], [1]),
         physical_seq_lens=[4],
         observe_query=[False],
-        is_genuine_decode=[True],
-        num_decoded_tokens=[2],
+        compact_now=[True],
         num_new_tokens=[1],
     )
     assert worker.compact() == {"td": 2}
@@ -276,8 +295,7 @@ def test_drop_first_shifts_across_shuffled_block_boundaries(monkeypatch):
         _metadata([block_ids], [1]),
         physical_seq_lens=[12],
         observe_query=[False],
-        is_genuine_decode=[True],
-        num_decoded_tokens=[1],
+        compact_now=[True],
         num_new_tokens=[1],
     )
 
@@ -308,8 +326,7 @@ def test_two_algorithms_compact_independently_in_same_batch(monkeypatch):
         physical_seq_lens=[8, 8],
         request_rows=[0, 1],
         observe_query=[False, False],
-        is_genuine_decode=[True, True],
-        num_decoded_tokens=[1, 1],
+        compact_now=[True, True],
         num_new_tokens=[1, 1],
     )
 
@@ -379,8 +396,7 @@ def test_algorithm_selection_failure_propagates(monkeypatch):
         _metadata([[3, 1]], [1]),
         physical_seq_lens=[8],
         observe_query=[False],
-        is_genuine_decode=[True],
-        num_decoded_tokens=[1],
+        compact_now=[True],
         num_new_tokens=[1],
     )
 
