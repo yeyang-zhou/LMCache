@@ -35,6 +35,7 @@ class TokenDropWorker:
 
         self._query_observation_indices: torch.Tensor | None = None
         self._query_observation_slices: list[tuple[str, int, int]] = []
+        self._observed_queries: dict[str, torch.Tensor] = {}
 
         self._query_hooks_installed = False
         self._query_hook_originals: dict[str, tuple[Any, Any]] = {}
@@ -386,12 +387,23 @@ class TokenDropWorker:
                 "or [tokens, q_heads, head_dim]"
             )
 
-        observed = query.index_select(0, self._query_observation_indices)
+        self._observed_queries[layer_name] = query.index_select(
+            0,
+            self._query_observation_indices,
+        )
+
+    def _flush_query_observations(self) -> None:
+        if not self._observed_queries:
+            return
+
         for request_id, start, end in self._query_observation_slices:
             self._algorithm_for_request(request_id).observe_query(
-                layer_name,
-                observed[start:end],
+                {
+                    layer_name: observed[start:end]
+                    for layer_name, observed in self._observed_queries.items()
+                }
             )
+        self._observed_queries.clear()
 
     def _slots_for_request(self, row: int, seq_len: int) -> torch.Tensor:
         assert self._block_table is not None
@@ -473,6 +485,8 @@ class TokenDropWorker:
         ):
             return {}
 
+        self._flush_query_observations()
+
         updates: dict[str, int] = {}
         for local_row, (request_id, worker_row, compact_now) in enumerate(
             zip(
@@ -498,6 +512,7 @@ class TokenDropWorker:
         self._request_rows = []
         self._query_observation_indices = None
         self._query_observation_slices = []
+        self._observed_queries.clear()
         self._seq_lens = None
         self._block_table = None
         self._compact_now = None

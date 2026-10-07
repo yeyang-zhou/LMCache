@@ -21,6 +21,7 @@ class _FakeAlgorithm:
         self.observe = observe
         self.compact_now = compact
         self.observations = {}
+        self.observation_batches = []
         self.observe_calls = []
         self.compact_calls = []
         self.selection_inputs = []
@@ -29,8 +30,10 @@ class _FakeAlgorithm:
         self.observe_calls.append(facts)
         return self.observe(facts) if callable(self.observe) else self.observe
 
-    def observe_query(self, layer_name, query):
-        self.observations.setdefault(layer_name, []).append(query.clone())
+    def observe_query(self, layer_queries):
+        self.observation_batches.append(tuple(layer_queries))
+        for layer_name, query in layer_queries.items():
+            self.observations.setdefault(layer_name, []).append(query.clone())
 
     def should_compact(self, **facts):
         self.compact_calls.append(facts)
@@ -148,6 +151,9 @@ def test_query_observation_forwards_full_request_step_even_for_prefill(monkeypat
     ).view(5, Q_HEADS, HEAD_DIM)
     for name in LAYER_NAMES:
         worker.capture_query(name, query)
+
+    assert worker.compact() == {}
+    assert algorithm.observation_batches == [tuple(LAYER_NAMES)]
 
     for name in LAYER_NAMES:
         assert len(algorithm.observations[name]) == 1
