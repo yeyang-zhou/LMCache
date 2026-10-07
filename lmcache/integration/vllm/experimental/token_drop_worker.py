@@ -130,21 +130,7 @@ class TokenDropWorker:
             for state, algorithm in zip(request_states, algorithms, strict=True)
         ]
 
-        attn_metadata = forward_context.attn_metadata
-        if not isinstance(attn_metadata, dict) or not attn_metadata:
-            raise ValueError("Token dropping MVP requires eager attention metadata")
-
-        representative = next(iter(attn_metadata.values()))
         ordered_states = list(request_states)
-        request_rows = [int(state.worker_row) for state in ordered_states]
-        if any(row < 0 for row in request_rows):
-            raise RuntimeError("Token-drop metadata is missing worker row identity")
-        if (
-            request_rows
-            and max(request_rows) + 1 >= representative.query_start_loc.shape[0]
-        ):
-            raise ValueError("Token-drop request/attention row mismatch")
-
         query_lens = [int(state.num_new_tokens) for state in ordered_states]
         if any(state.resident_kv_tokens is None for state in ordered_states):
             raise RuntimeError(
@@ -160,6 +146,42 @@ class TokenDropWorker:
             )
         ):
             raise ValueError("Token dropping received invalid physical/query lengths")
+
+        if not any(observe_query):
+            compact_without_observation = [
+                bool(
+                    algorithm.should_compact(
+                        resident_len=physical_len,
+                        num_decoded_tokens=int(state.num_decoded_tokens),
+                        num_new_tokens=int(state.num_new_tokens),
+                        is_genuine_decode=bool(state.is_genuine_decode),
+                    )
+                )
+                for state, algorithm, physical_len in zip(
+                    ordered_states,
+                    algorithms,
+                    physical_seq_lens,
+                    strict=True,
+                )
+            ]
+            if not any(compact_without_observation):
+                self.remove_query_hooks()
+                self._clear_step()
+                return
+
+        attn_metadata = forward_context.attn_metadata
+        if not isinstance(attn_metadata, dict) or not attn_metadata:
+            raise ValueError("Token dropping MVP requires eager attention metadata")
+
+        representative = next(iter(attn_metadata.values()))
+        request_rows = [int(state.worker_row) for state in ordered_states]
+        if any(row < 0 for row in request_rows):
+            raise RuntimeError("Token-drop metadata is missing worker row identity")
+        if (
+            request_rows
+            and max(request_rows) + 1 >= representative.query_start_loc.shape[0]
+        ):
+            raise ValueError("Token-drop request/attention row mismatch")
 
         if any(observe_query):
             self.install_query_hooks(forward_context.no_compile_layers)

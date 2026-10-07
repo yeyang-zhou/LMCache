@@ -172,6 +172,25 @@ def test_compaction_does_not_depend_on_query_observation(monkeypatch):
     assert worker._query_hooks_installed is False
     assert worker.compact() == {"td": 4}
     assert algorithm.observations == {}
+    assert len(algorithm.compact_calls) == 2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_idle_step_skips_attention_setup(monkeypatch):
+    algorithm = _FakeAlgorithm(kept=[0], observe=False, compact=False)
+    _install_algorithms(monkeypatch, {"a": algorithm})
+
+    worker = TokenDropWorker()
+    worker.register_kv_caches(_new_cache(4))
+    state = _state("td", "a", resident=8, worker_row=0)
+    forward_context = SimpleNamespace(
+        attn_metadata=None,
+        no_compile_layers={},
+    )
+
+    worker.prepare_forward(forward_context, [state])
+    assert worker._query_hooks_installed is False
+    assert worker.compact() == {}
     assert len(algorithm.compact_calls) == 1
 
 
