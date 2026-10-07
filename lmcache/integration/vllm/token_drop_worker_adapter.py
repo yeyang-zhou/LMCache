@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Version-pinned vLLM worker adaptor for LMCache R-KV physical KV state."""
+"""Version-pinned vLLM worker adaptor for LMCache token-drop physical KV state."""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ class _SlotMappingOverride:
 
 
 _slot_mapping_override: ContextVar[_SlotMappingOverride | None] = ContextVar(
-    "lmcache_rkv_slot_mapping_override",
+    "lmcache_token_drop_slot_mapping_override",
     default=None,
 )
 
@@ -63,14 +63,14 @@ def _find_token_drop_requests(metadata: Any) -> list[Any] | None:
 
 
 def _ensure_physical_buffers(runner: Any) -> tuple[Any, Any]:
-    positions = getattr(runner, "_lmcache_rkv_physical_positions", None)
-    seq_lens = getattr(runner, "_lmcache_rkv_physical_seq_lens", None)
+    positions = getattr(runner, "_lmcache_token_drop_physical_positions", None)
+    seq_lens = getattr(runner, "_lmcache_token_drop_physical_seq_lens", None)
     if positions is None:
         positions = runner._make_buffer(runner.max_num_tokens, dtype=torch.int64)
-        runner._lmcache_rkv_physical_positions = positions
+        runner._lmcache_token_drop_physical_positions = positions
     if seq_lens is None:
         seq_lens = runner._make_buffer(runner.max_num_reqs, dtype=torch.int32)
-        runner._lmcache_rkv_physical_seq_lens = seq_lens
+        runner._lmcache_token_drop_physical_seq_lens = seq_lens
     return positions, seq_lens
 
 
@@ -190,7 +190,7 @@ def _compute_slot_mapping_with_physical_positions(
     return original(block_table, num_reqs, query_start_loc, positions)
 
 
-def install_token_drop_worker_adaptor() -> None:
+def install_token_drop_worker_adapter() -> None:
     """Install the worker-side token-drop KV adaptor for pinned vLLM 0.25.1."""
     # Third Party
     from vllm.version import __version__ as vllm_version
@@ -206,7 +206,7 @@ def install_token_drop_worker_adaptor() -> None:
     original_prepare_inputs = GPUModelRunner._prepare_inputs
     if not getattr(
         original_prepare_inputs,
-        "_lmcache_token_drop_worker_adaptor",
+        "_lmcache_token_drop_worker_adapter",
         False,
     ):
         params = tuple(signature(original_prepare_inputs).parameters)
@@ -228,13 +228,13 @@ def install_token_drop_worker_adaptor() -> None:
                 num_scheduled_tokens,
             )
 
-        wrapped_prepare_inputs._lmcache_token_drop_worker_adaptor = True  # type: ignore[attr-defined]
+        wrapped_prepare_inputs._lmcache_token_drop_worker_adapter = True  # type: ignore[attr-defined]
         GPUModelRunner._prepare_inputs = wrapped_prepare_inputs
 
     original_compute_slot_mapping = MultiGroupBlockTable.compute_slot_mapping
     if not getattr(
         original_compute_slot_mapping,
-        "_lmcache_token_drop_worker_adaptor",
+        "_lmcache_token_drop_worker_adapter",
         False,
     ):
         params = tuple(signature(original_compute_slot_mapping).parameters)
@@ -259,5 +259,5 @@ def install_token_drop_worker_adaptor() -> None:
                 positions,
             )
 
-        wrapped_compute_slot_mapping._lmcache_token_drop_worker_adaptor = True  # type: ignore[attr-defined]
+        wrapped_compute_slot_mapping._lmcache_token_drop_worker_adapter = True  # type: ignore[attr-defined]
         MultiGroupBlockTable.compute_slot_mapping = wrapped_compute_slot_mapping

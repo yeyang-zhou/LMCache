@@ -41,7 +41,7 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (  # noqa: E402
     LMCacheMPWorkerMetadata,
 )
 from lmcache.integration.vllm.token_drop import TokenDropSpec  # noqa: E402
-from lmcache.integration.vllm.rkv_allocator_adapter import (  # noqa: E402
+from lmcache.integration.vllm.token_drop_allocator_adapter import (  # noqa: E402
     clear_resident_kv_tokens,
     get_resident_kv_tokens,
     set_resident_kv_tokens,
@@ -76,18 +76,11 @@ def _config(transfer_config: KVTransferConfig) -> VllmConfig:
 
 def _token_drop_config(
     *,
-    budget: int = 32,
-    buffer: int = 16,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    rkv_config = {
-        "budget": budget,
-        "buffer": buffer,
-        **(config or {}),
-    }
     return {
-        "algorithm": "rkv",
-        "config": rkv_config,
+        "algorithm": "fake",
+        "config": dict(config or {}),
     }
 
 
@@ -241,7 +234,7 @@ def test_token_drop_is_request_local_and_skips_only_its_lmcache_lookup(
     install = MagicMock()
     monkeypatch.setattr(
         connector_mod,
-        "install_token_drop_allocator_adaptor",
+        "install_token_drop_allocator_adapter",
         install,
     )
     try:
@@ -249,14 +242,7 @@ def test_token_drop_is_request_local_and_skips_only_its_lmcache_lookup(
         token_drop = _request(
             "td",
             token_drop=_token_drop_config(
-                budget=64,
-                buffer=40,
-                config={
-                    "window_size": 4,
-                    "kernel_size": 5,
-                    "mix_lambda": 0.25,
-                    "retain_ratio": 0.2,
-                },
+                config={"algorithm_owned": {"opaque": True}},
             ),
         )
 
@@ -268,10 +254,8 @@ def test_token_drop_is_request_local_and_skips_only_its_lmcache_lookup(
         assert scheduler.request_trackers["normal"].token_drop_spec is None
         spec = scheduler.request_trackers["td"].token_drop_spec
         assert spec is not None
-        assert spec.algorithm == "rkv"
-        assert spec.config["budget"] == 64
-        assert spec.config["buffer"] == 40
-        assert spec.config["window_size"] == 4
+        assert spec.algorithm == "fake"
+        assert spec.config == {"algorithm_owned": {"opaque": True}}
 
         mock_io.scheduler.maybe_submit_lookup_request.assert_called_once()
         assert (
@@ -283,7 +267,7 @@ def test_token_drop_is_request_local_and_skips_only_its_lmcache_lookup(
         scheduler.shutdown()
 
 
-def test_worker_registers_lmcache_and_rkv_over_same_kv_pool(
+def test_worker_registers_lmcache_and_token_drop_over_same_kv_pool(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connector = LMCacheMPConnector.__new__(LMCacheMPConnector)
@@ -291,7 +275,7 @@ def test_worker_registers_lmcache_and_rkv_over_same_kv_pool(
     connector._kv_cache_config = None
     connector._dcp_size = 1
     connector.worker_adapter = MagicMock()
-    connector._rkv = MagicMock()
+    connector._token_drop_worker = MagicMock()
     connector.dispatcher = None
 
     group_infos = object()
@@ -315,7 +299,7 @@ def test_worker_registers_lmcache_and_rkv_over_same_kv_pool(
         engine_group_infos=group_infos,
         layout_hints=None,
     )
-    connector._rkv.register_kv_caches.assert_called_once_with(caches)
+    connector._token_drop_worker.register_kv_caches.assert_called_once_with(caches)
 
 
 def test_worker_reports_resident_kv_update_once() -> None:
@@ -384,7 +368,7 @@ def test_scheduler_commits_resident_kv_and_reclaims_private_tail() -> None:
         "request": SimpleNamespace(blocks=[row]),
     }
     tracker = SimpleNamespace(
-        token_drop_spec=TokenDropSpec("rkv", {"budget": 32, "buffer": 32}),
+        token_drop_spec=TokenDropSpec("fake", {}),
         num_scheduled_tokens=104,
         allocated_block_ids={0: list(range(10, 17))},
     )
@@ -412,7 +396,7 @@ def test_scheduler_rejects_non_private_token_drop_block() -> None:
     }
     scheduler.request_trackers = {
         "request": SimpleNamespace(
-            token_drop_spec=TokenDropSpec("rkv", {"budget": 16, "buffer": 16}),
+            token_drop_spec=TokenDropSpec("fake", {}),
             num_scheduled_tokens=32,
             allocated_block_ids={0: [10, 11]},
         )
@@ -439,7 +423,7 @@ def test_scheduler_checks_private_blocks_before_worker_metadata() -> None:
     }
     scheduler.request_trackers = {
         "request": SimpleNamespace(
-            token_drop_spec=TokenDropSpec("rkv", {"budget": 16, "buffer": 16}),
+            token_drop_spec=TokenDropSpec("fake", {}),
             num_scheduled_tokens=17,
             all_token_ids=list(range(17)),
             num_prompt_tokens=16,
@@ -471,7 +455,7 @@ def test_scheduler_reclaims_to_resident_frontier_without_token_drop_reserve() ->
         "request": SimpleNamespace(blocks=[row]),
     }
     tracker = SimpleNamespace(
-        token_drop_spec=TokenDropSpec("rkv", {"budget": 32, "buffer": 32}),
+        token_drop_spec=TokenDropSpec("fake", {}),
         num_scheduled_tokens=64,
         allocated_block_ids={0: list(range(10, 14))},
     )
@@ -496,12 +480,8 @@ def test_scheduler_builds_request_local_token_drop_state() -> None:
     scheduler.request_trackers = {
         "request": SimpleNamespace(
             token_drop_spec=TokenDropSpec(
-                "rkv",
-                {
-                    "budget": 64,
-                    "buffer": 40,
-                    "window_size": 4,
-                },
+                "fake",
+                {"algorithm_owned": "opaque"},
             ),
             allocated_block_ids={0: [10, 11, 18]},
             num_scheduled_tokens=33,
@@ -520,12 +500,8 @@ def test_scheduler_builds_request_local_token_drop_state() -> None:
     assert metadata.token_drop_requests == [
         LMCacheMPTokenDropRequestState(
             request_id="request",
-            algorithm="rkv",
-            config={
-                "budget": 64,
-                "buffer": 40,
-                "window_size": 4,
-            },
+            algorithm="fake",
+            config={"algorithm_owned": "opaque"},
             resident_kv_tokens=33,
             has_physical_override=False,
             is_genuine_decode=True,
@@ -540,12 +516,8 @@ def test_scheduler_builds_request_local_token_drop_state() -> None:
     assert metadata.token_drop_requests == [
         LMCacheMPTokenDropRequestState(
             request_id="request",
-            algorithm="rkv",
-            config={
-                "budget": 64,
-                "buffer": 40,
-                "window_size": 4,
-            },
+            algorithm="fake",
+            config={"algorithm_owned": "opaque"},
             resident_kv_tokens=33,
             has_physical_override=True,
             is_genuine_decode=True,
@@ -556,15 +528,17 @@ def test_scheduler_builds_request_local_token_drop_state() -> None:
     clear_resident_kv_tokens("request")
 
 
-def _rkv_worker_connector(
+def _token_drop_worker_connector(
     metadata: LMCacheMPConnectorMetadata,
 ) -> tuple[LMCacheMPConnector, MagicMock]:
     worker = LMCacheMPConnector.__new__(LMCacheMPConnector)
     worker._role = KVConnectorRole.WORKER
-    rkv = MagicMock()
-    rkv.compact.return_value = {"request": 17}
-    rkv.is_token_drop_request.side_effect = lambda request_id: request_id == "request"
-    worker._rkv = rkv
+    token_drop_worker = MagicMock()
+    token_drop_worker.compact.return_value = {"request": 17}
+    token_drop_worker.is_token_drop_request.side_effect = (
+        lambda request_id: request_id == "request"
+    )
+    worker._token_drop_worker = token_drop_worker
     worker._pending_resident_kv_updates = {}
     worker._connector_metadata = metadata
     worker.dispatcher = None
@@ -572,14 +546,14 @@ def _rkv_worker_connector(
     worker._can_store = False
     worker.worker_adapter = MagicMock()
     worker.worker_adapter.get_finished.return_value = (None, None)
-    return worker, rkv
+    return worker, token_drop_worker
 
 
 def _token_drop_state(request_id: str = "request") -> LMCacheMPTokenDropRequestState:
     return LMCacheMPTokenDropRequestState(
         request_id=request_id,
-        algorithm="rkv",
-        config={"budget": 32, "buffer": 16},
+        algorithm="fake",
+        config={"algorithm_owned": "opaque"},
         resident_kv_tokens=33,
         has_physical_override=True,
         is_genuine_decode=True,
@@ -588,59 +562,59 @@ def _token_drop_state(request_id: str = "request") -> LMCacheMPTokenDropRequestS
     )
 
 
-def test_rkv_worker_connector_lifecycle_is_request_local() -> None:
+def test_token_drop_worker_connector_lifecycle_is_request_local() -> None:
     metadata = LMCacheMPConnectorMetadata()
     metadata.need_flush_before_forward = True
     metadata.token_drop_requests.append(_token_drop_state())
     metadata.token_drop_reset_ids.add("request")
-    worker, rkv = _rkv_worker_connector(metadata)
+    worker, token_drop_worker = _token_drop_worker_connector(metadata)
     worker._pending_resident_kv_updates["request"] = 99
     forward_context = SimpleNamespace()
 
     worker.handle_preemptions(metadata)
     worker.worker_adapter.handle_preemptions.assert_called_once_with(True)
-    rkv.drop_requests.assert_called_once_with({"request"})
+    token_drop_worker.drop_requests.assert_called_once_with({"request"})
     assert worker._pending_resident_kv_updates == {}
 
     worker.start_load_kv(forward_context)
-    rkv.prepare_forward.assert_called_once_with(
+    token_drop_worker.prepare_forward.assert_called_once_with(
         forward_context,
         metadata.token_drop_requests,
     )
 
     worker.wait_for_save()
-    rkv.compact.assert_called_once_with()
+    token_drop_worker.compact.assert_called_once_with()
     worker_meta = worker.build_connector_worker_meta()
     assert isinstance(worker_meta, LMCacheMPWorkerMetadata)
     assert worker_meta.resident_kv_updates == {"request": 17}
 
     worker._pending_resident_kv_updates["request"] = 17
     worker.get_finished({"request"})
-    assert rkv.drop_requests.call_args_list[-1].args == ({"request"},)
+    assert token_drop_worker.drop_requests.call_args_list[-1].args == ({"request"},)
     assert worker._pending_resident_kv_updates == {}
     worker.worker_adapter.get_finished.assert_called_once_with(set())
 
 
-def test_rkv_no_forward_step_clears_step_state() -> None:
+def test_token_drop_no_forward_step_clears_step_state() -> None:
     metadata = LMCacheMPConnectorMetadata()
-    worker, rkv = _rkv_worker_connector(metadata)
+    worker, token_drop_worker = _token_drop_worker_connector(metadata)
     forward_context = SimpleNamespace()
 
     worker.start_load_kv(forward_context)
 
-    rkv.prepare_forward.assert_called_once_with(forward_context, [])
+    token_drop_worker.prepare_forward.assert_called_once_with(forward_context, [])
 
 
 def test_normal_preemption_does_not_reset_token_drop_state() -> None:
     metadata = LMCacheMPConnectorMetadata()
     metadata.need_flush_before_forward = True
     metadata.token_drop_requests.append(_token_drop_state("td"))
-    worker, rkv = _rkv_worker_connector(metadata)
+    worker, token_drop_worker = _token_drop_worker_connector(metadata)
 
     worker.handle_preemptions(metadata)
 
     worker.worker_adapter.handle_preemptions.assert_called_once_with(True)
-    rkv.drop_requests.assert_not_called()
+    token_drop_worker.drop_requests.assert_not_called()
 
 
 def test_normal_lmcache_retrieve_and_token_drop_can_share_worker_step() -> None:
@@ -655,12 +629,12 @@ def test_normal_lmcache_retrieve_and_token_drop_can_share_worker_step() -> None:
             request_configs=None,
         )
     )
-    worker, rkv = _rkv_worker_connector(metadata)
+    worker, token_drop_worker = _token_drop_worker_connector(metadata)
     forward_context = SimpleNamespace()
 
     worker.start_load_kv(forward_context)
 
-    rkv.prepare_forward.assert_called_once_with(
+    token_drop_worker.prepare_forward.assert_called_once_with(
         forward_context,
         metadata.token_drop_requests,
     )
@@ -691,7 +665,7 @@ def test_normal_store_and_token_drop_share_scheduler_step(
     scheduler.bind_gpu_block_pool(mock_io.pool)
     monkeypatch.setattr(
         connector_mod,
-        "install_token_drop_allocator_adaptor",
+        "install_token_drop_allocator_adapter",
         MagicMock(),
     )
     try:
@@ -1004,7 +978,7 @@ def test_token_drop_finish_marks_final_worker_update_stale_without_lmcache() -> 
     scheduler._token_drop_finished_before_output = set()
     scheduler.request_trackers = {
         "request": SimpleNamespace(
-            token_drop_spec=TokenDropSpec("rkv", {"budget": 32, "buffer": 16}),
+            token_drop_spec=TokenDropSpec("fake", {}),
         )
     }
     scheduler.scheduler_adapter = MagicMock()
@@ -1023,7 +997,7 @@ def test_token_drop_finish_marks_final_worker_update_stale_without_lmcache() -> 
     scheduler.scheduler_adapter.end_session.assert_not_called()
 
 
-def test_rkv_ignores_final_update_after_request_finished() -> None:
+def test_token_drop_ignores_final_update_after_request_finished() -> None:
     scheduler = LMCacheMPConnector.__new__(LMCacheMPConnector)
     scheduler._token_drop_finished_before_output = {"finished"}
     scheduler._kv_cache_events = None
@@ -1059,7 +1033,7 @@ def test_rkv_ignores_final_update_after_request_finished() -> None:
         (641, 1, 641, (True, 128)),  # boundary is visible on the next forward
         (300, 100, 700, (False, 0)),  # preemption replay / prefill
         (639, 1, 700, (False, 126)),  # replaying generated history
-        (640, 1, 640, (True, 127)),  # catch-up fact; R-KV decides when to compact
+        (640, 1, 640, (True, 127)),  # catch-up fact; algorithm decides cadence
     ],
 )
 def test_token_drop_step_facts_are_algorithm_config_free(
@@ -1090,7 +1064,7 @@ def test_token_drop_step_facts_are_algorithm_config_free(
         ("multi_group", "exactly one KV cache group"),
     ],
 )
-def test_unsupported_rkv_modes_reject_only_opt_in_request(
+def test_unsupported_token_drop_modes_reject_only_opt_in_request(
     case: str,
     match: str,
     mock_io: SimpleNamespace,

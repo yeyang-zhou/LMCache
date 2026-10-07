@@ -4,12 +4,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from lmcache.integration.vllm.rkv_allocator_adapter import (
+from lmcache.integration.vllm.token_drop_allocator_adapter import (
     _allocate_with_resident_frontier,
     _keep_token_drop_blocks_private,
     clear_resident_kv_tokens,
     get_resident_kv_tokens,
-    install_token_drop_allocator_adaptor,
+    install_token_drop_allocator_adapter,
     set_resident_kv_tokens,
 )
 
@@ -38,11 +38,8 @@ def _request(logical: int, *, token_drop: bool = True):
     transfer = (
         {
             "lmcache.token_drop": {
-                "algorithm": "rkv",
-                "config": {
-                    "budget": 32,
-                    "buffer": 16,
-                },
+                "algorithm": "fake",
+                "config": {},
             }
         }
         if token_drop
@@ -266,13 +263,13 @@ def test_install_allocator_adaptor_is_idempotent_for_pinned_vllm():
     original_allocate = KVCacheManager.allocate_slots
     original_cache = BlockPool.cache_full_blocks
     try:
-        install_token_drop_allocator_adaptor()
+        install_token_drop_allocator_adapter()
         wrapped_allocate = KVCacheManager.allocate_slots
         wrapped_cache = BlockPool.cache_full_blocks
 
         assert getattr(
             wrapped_allocate,
-            "_lmcache_token_drop_allocator_adaptor",
+            "_lmcache_token_drop_allocator_adapter",
             False,
         )
         assert getattr(
@@ -281,7 +278,7 @@ def test_install_allocator_adaptor_is_idempotent_for_pinned_vllm():
             False,
         )
 
-        install_token_drop_allocator_adaptor()
+        install_token_drop_allocator_adapter()
         assert KVCacheManager.allocate_slots is wrapped_allocate
         assert BlockPool.cache_full_blocks is wrapped_cache
     finally:

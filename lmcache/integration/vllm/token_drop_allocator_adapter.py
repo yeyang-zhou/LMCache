@@ -191,7 +191,7 @@ def _keep_token_drop_blocks_private(
     )
 
 
-def install_token_drop_allocator_adaptor() -> None:
+def install_token_drop_allocator_adapter() -> None:
     """Install resident-frontier and private-block adaptors for vLLM 0.25.1."""
     # Third Party
     from vllm.version import __version__ as vllm_version
@@ -207,7 +207,7 @@ def install_token_drop_allocator_adaptor() -> None:
     original_allocate = KVCacheManager.allocate_slots
     if not getattr(
         original_allocate,
-        "_lmcache_token_drop_allocator_adaptor",
+        "_lmcache_token_drop_allocator_adapter",
         False,
     ):
         params = tuple(signature(original_allocate).parameters)
@@ -248,7 +248,7 @@ def install_token_drop_allocator_adaptor() -> None:
                 has_scheduled_reqs,
             )
 
-        wrapped_allocate._lmcache_token_drop_allocator_adaptor = True  # type: ignore[attr-defined]
+        wrapped_allocate._lmcache_token_drop_allocator_adapter = True  # type: ignore[attr-defined]
         KVCacheManager.allocate_slots = wrapped_allocate
 
     # This is the actual unhashed->cached promotion boundary. Keep the

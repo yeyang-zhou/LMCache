@@ -6,11 +6,11 @@ import numpy as np
 import pytest
 import torch
 
-from lmcache.integration.vllm.rkv_worker_adaptor import (
+from lmcache.integration.vllm.token_drop_worker_adapter import (
     _compute_slot_mapping_with_physical_positions,
     _find_token_drop_requests,
     _prepare_inputs_with_physical_frontier,
-    install_token_drop_worker_adaptor,
+    install_token_drop_worker_adapter,
 )
 
 
@@ -167,22 +167,22 @@ def test_install_worker_adaptor_is_idempotent_for_pinned_vllm() -> None:
     original_prepare = GPUModelRunner._prepare_inputs
     original_slot_mapping = MultiGroupBlockTable.compute_slot_mapping
     try:
-        install_token_drop_worker_adaptor()
+        install_token_drop_worker_adapter()
         wrapped_prepare = GPUModelRunner._prepare_inputs
         wrapped_slot_mapping = MultiGroupBlockTable.compute_slot_mapping
 
         assert getattr(
             wrapped_prepare,
-            "_lmcache_token_drop_worker_adaptor",
+            "_lmcache_token_drop_worker_adapter",
             False,
         )
         assert getattr(
             wrapped_slot_mapping,
-            "_lmcache_token_drop_worker_adaptor",
+            "_lmcache_token_drop_worker_adapter",
             False,
         )
 
-        install_token_drop_worker_adaptor()
+        install_token_drop_worker_adapter()
         assert GPUModelRunner._prepare_inputs is wrapped_prepare
         assert MultiGroupBlockTable.compute_slot_mapping is wrapped_slot_mapping
     finally:

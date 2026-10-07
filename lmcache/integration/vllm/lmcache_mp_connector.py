@@ -45,7 +45,7 @@ import zmq
 # First Party
 from lmcache.banner import print_banner_once
 from lmcache.integration.vllm.experimental import dispatch
-from lmcache.integration.vllm.experimental.rkv_worker import RKVWorker
+from lmcache.integration.vllm.experimental.token_drop_worker import TokenDropWorker
 from lmcache.integration.vllm.kv_cache_group_edits import (
     apply_kv_cache_group_edits,
     validate_kv_cache_groups,
@@ -64,14 +64,14 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (
     LMCacheMPTokenDropRequestState,
     LMCacheMPWorkerMetadata,
 )
-from lmcache.integration.vllm.rkv_allocator_adapter import (
+from lmcache.integration.vllm.token_drop_allocator_adapter import (
     clear_resident_kv_tokens,
     get_resident_kv_tokens,
-    install_token_drop_allocator_adaptor,
+    install_token_drop_allocator_adapter,
     set_resident_kv_tokens,
 )
-from lmcache.integration.vllm.rkv_worker_adaptor import (
-    install_token_drop_worker_adaptor,
+from lmcache.integration.vllm.token_drop_worker_adapter import (
+    install_token_drop_worker_adapter,
 )
 from lmcache.integration.vllm.lmcache_mp_metrics import (
     LMCacheMPConnectorStats,
@@ -626,7 +626,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # Token dropping is selected per request via kv_transfer_params.
         # Connector configuration never switches the whole engine into a
         # token-dropping mode.
-        self._rkv: RKVWorker | None = None
+        self._token_drop_worker: TokenDropWorker | None = None
 
         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
@@ -760,8 +760,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         elif self.role == KVConnectorRole.WORKER:
             # Node routing: a worker connects only to its local LMCache server.
             # Global ranks are assigned to nodes in contiguous blocks:
-            #   node 0 → ranks [0, ranks_per_node),
-            #   node 1 → [ranks_per_node, 2 * ranks_per_node), ...
+            #   node 0 鈫?ranks [0, ranks_per_node),
+            #   node 1 鈫?[ranks_per_node, 2 * ranks_per_node), ...
             ranks_per_node = parallel_strategy.vllm_world_size // n_servers
             local_server_url = server_urls[
                 parallel_strategy.vllm_worker_id // ranks_per_node
@@ -778,7 +778,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             self._pending_resident_kv_updates: dict[str, int] = {}
             # Generic helper only. Whether a request token-drops is decided
             # exclusively by its request config and sparse scheduler metadata.
-            self._rkv = RKVWorker()
+            self._token_drop_worker = TokenDropWorker()
             if self.transfer_intermediate_tensors:
                 # First Party
                 from lmcache.integration.vllm.experimental import (
@@ -889,15 +889,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             dcp_size=self._dcp_size,
         )
         # Mixed batches need both capabilities over the same paged KV pool:
-        # LMCache transfers normal requests, while R-KV only touches requests
+        # LMCache transfers normal requests, while token dropping only touches requests
         # carrying token-drop config.
         self.worker_adapter.register_kv_caches(
             kv_caches,
             engine_group_infos=engine_group_infos,
             layout_hints=layout_hints,
         )
-        if self._rkv is not None:
-            self._rkv.register_kv_caches(kv_caches)
+        if self._token_drop_worker is not None:
+            self._token_drop_worker.register_kv_caches(kv_caches)
         if self.dispatcher is not None:
             dispatch(
                 self.dispatcher,
@@ -926,8 +926,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
 
-        if self._rkv is not None:
-            self._rkv.prepare_forward(
+        if self._token_drop_worker is not None:
+            self._token_drop_worker.prepare_forward(
                 forward_context,
                 metadata.token_drop_requests,
             )
@@ -1012,8 +1012,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
 
-        if self._rkv is not None:
-            self._pending_resident_kv_updates.update(self._rkv.compact())
+        if self._token_drop_worker is not None:
+            self._pending_resident_kv_updates.update(self._token_drop_worker.compact())
 
         request_ids = []
         ops = []
@@ -1065,9 +1065,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if metadata.token_drop_requests:
             # execute_model() calls this hook before _prepare_inputs(), so the
             # adaptor is active before the first token-drop row is prepared.
-            install_token_drop_worker_adaptor()
-        if self._rkv is not None and metadata.token_drop_reset_ids:
-            self._rkv.drop_requests(metadata.token_drop_reset_ids)
+            install_token_drop_worker_adapter()
+        if self._token_drop_worker is not None and metadata.token_drop_reset_ids:
+            self._token_drop_worker.drop_requests(metadata.token_drop_reset_ids)
             for request_id in metadata.token_drop_reset_ids:
                 self._pending_resident_kv_updates.pop(request_id, None)
 
@@ -1088,13 +1088,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             call to this method (this call or a prior one).
         """
         token_drop_finished: set[str] = set()
-        if self._rkv is not None and finished_req_ids:
+        if self._token_drop_worker is not None and finished_req_ids:
             token_drop_finished = {
                 request_id
                 for request_id in finished_req_ids
-                if self._rkv.is_token_drop_request(request_id)
+                if self._token_drop_worker.is_token_drop_request(request_id)
             }
-            self._rkv.drop_requests(token_drop_finished)
+            self._token_drop_worker.drop_requests(token_drop_finished)
             for request_id in token_drop_finished:
                 self._pending_resident_kv_updates.pop(request_id, None)
 
@@ -1403,7 +1403,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if tracker.token_drop_spec is not None:
             self._validate_token_drop_request(tracker)
             request.skip_reading_prefix_cache = True
-            install_token_drop_allocator_adaptor()
+            install_token_drop_allocator_adapter()
             return
 
         if not self._eager_prefetch or request.resumable:
@@ -1484,7 +1484,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # retrieve from LMCache.
             if tracker.num_lmcache_hit_tokens > 0:
                 if not condition:
-                    # No retrieve needed — free ALL locked chunks
+                    # No retrieve needed 鈥?free ALL locked chunks
                     free_end = tracker.num_lmcache_hit_tokens
                 else:
                     # Note(Roy): Boundary misalignment between vLLM blocks and LMCache
