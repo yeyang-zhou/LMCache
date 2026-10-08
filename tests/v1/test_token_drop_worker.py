@@ -26,16 +26,26 @@ class _FakeAlgorithm:
         self.compact_calls = []
         self.selection_inputs = []
 
-    def should_observe_query(self, **facts):
+    def should_observe_token_queries(self, phase, decoded_tokens_before_step):
+        facts = {
+            "phase": phase,
+            "decoded_tokens_before_step": decoded_tokens_before_step,
+        }
         self.observe_calls.append(facts)
-        return self.observe(facts) if callable(self.observe) else self.observe
+        result = self.observe(facts) if callable(self.observe) else self.observe
+        return int(result)
 
-    def observe_query(self, layer_queries):
+    def observe_token_queries(self, layer_queries):
         self.observation_batches.append(tuple(layer_queries))
         for layer_name, query in layer_queries.items():
             self.observations.setdefault(layer_name, []).append(query.clone())
 
-    def should_compact(self, **facts):
+    def should_compact_kv(self, phase, resident_kv_tokens, decoded_tokens_before_step):
+        facts = {
+            "phase": phase,
+            "resident_kv_tokens": resident_kv_tokens,
+            "decoded_tokens_before_step": decoded_tokens_before_step,
+        }
         self.compact_calls.append(facts)
         return (
             self.compact_now(facts)
@@ -43,11 +53,22 @@ class _FakeAlgorithm:
             else self.compact_now
         )
 
-    def select_kept_positions(self, layer_keys):
-        self.selection_inputs.append(layer_keys)
-        first = next(iter(layer_keys.values()))
-        kept = self.kept(layer_keys) if callable(self.kept) else self.kept
-        return torch.as_tensor(kept, dtype=torch.long, device=first.device)
+    def select_kept_token_positions(self, kv_by_layer):
+        self.selection_inputs.append(kv_by_layer)
+        kept = self.kept(kv_by_layer) if callable(self.kept) else self.kept
+        if isinstance(kept, dict):
+            return {
+                name: torch.as_tensor(
+                    value, dtype=torch.long, device=view.get_keys().device
+                )
+                for name, view in kv_by_layer.items()
+                for value in [kept[name]]
+            }
+        return {
+            name: torch.as_tensor(kept, dtype=torch.long, device=view.get_keys().device)
+            .unsqueeze(0).expand(view.get_keys().shape[1], -1).clone()
+            for name, view in kv_by_layer.items()
+        }
 
 
 def _install_algorithms(monkeypatch, algorithms):
@@ -139,7 +160,7 @@ def test_query_observation_forwards_full_request_step_even_for_prefill(monkeypat
         metadata,
         physical_seq_lens=[7],
         request_rows=[1],
-        observe_query=[True],
+        observe_counts=[2],
         compact_now=[False],
         num_new_tokens=[3],
     )
@@ -157,7 +178,7 @@ def test_query_observation_forwards_full_request_step_even_for_prefill(monkeypat
 
     for name in LAYER_NAMES:
         assert len(algorithm.observations[name]) == 1
-        assert torch.equal(algorithm.observations[name][0], query[2:5])
+        assert torch.equal(algorithm.observations[name][0], query[3:5])
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -223,7 +244,7 @@ def test_compaction_applies_algorithm_positions_on_cuda(monkeypatch, dtype):
         ["td"],
         _metadata([block_ids], [1]),
         physical_seq_lens=[8],
-        observe_query=[False],
+        observe_counts=[0],
         compact_now=[True],
         num_new_tokens=[1],
     )
@@ -255,7 +276,7 @@ def test_repeated_compaction_uses_current_physical_sequence(monkeypatch):
         ["td"],
         _metadata([block_ids], [1]),
         physical_seq_lens=[8],
-        observe_query=[False],
+        observe_counts=[0],
         compact_now=[True],
         num_new_tokens=[1],
     )
@@ -266,7 +287,7 @@ def test_repeated_compaction_uses_current_physical_sequence(monkeypatch):
         ["td"],
         _metadata([block_ids], [1]),
         physical_seq_lens=[4],
-        observe_query=[False],
+        observe_counts=[0],
         compact_now=[True],
         num_new_tokens=[1],
     )
@@ -300,7 +321,7 @@ def test_drop_first_shifts_across_shuffled_block_boundaries(monkeypatch):
         ["td"],
         _metadata([block_ids], [1]),
         physical_seq_lens=[12],
-        observe_query=[False],
+        observe_counts=[0],
         compact_now=[True],
         num_new_tokens=[1],
     )
@@ -331,7 +352,7 @@ def test_two_algorithms_compact_independently_in_same_batch(monkeypatch):
         _metadata([[4, 1], [3, 2]], [1, 1]),
         physical_seq_lens=[8, 8],
         request_rows=[0, 1],
-        observe_query=[False, False],
+        observe_counts=[0, False],
         compact_now=[True, True],
         num_new_tokens=[1, 1],
     )
@@ -388,7 +409,7 @@ def test_token_drop_rejects_noncontiguous_kv_layout():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_algorithm_selection_failure_propagates(monkeypatch):
     class _Rejecting(_FakeAlgorithm):
-        def select_kept_positions(self, layer_keys):
+        def select_kept_token_positions(self, layer_keys):
             raise RuntimeError("algorithm selection failed")
 
     algorithm = _Rejecting(compact=True)
@@ -401,10 +422,42 @@ def test_algorithm_selection_failure_propagates(monkeypatch):
         ["td"],
         _metadata([[3, 1]], [1]),
         physical_seq_lens=[8],
-        observe_query=[False],
+        observe_counts=[0],
         compact_now=[True],
         num_new_tokens=[1],
     )
 
     with pytest.raises(RuntimeError, match="algorithm selection failed"):
         worker.compact()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_per_layer_per_head_ordered_compaction(monkeypatch):
+    kept = {
+        "layer.0": [[6, 2, 7], [5, 1, 3]],
+        "layer.1": [[0, 7, 2], [4, 1, 6]],
+    }
+    algorithm = _FakeAlgorithm(kept=kept, compact=True)
+    _install_algorithms(monkeypatch, {"a": algorithm})
+    caches = _new_cache(4)
+    originals = {name: cache.clone() for name, cache in caches.items()}
+    block_ids = [3, 1]
+    slots = _slots(block_ids, 8)
+
+    worker = TokenDropWorker()
+    worker.register_kv_caches(caches)
+    worker._algorithm_from_state(_state("td", "a", resident=8))
+    worker.begin_step(
+        ["td"], _metadata([block_ids], [1]),
+        physical_seq_lens=[8], observe_counts=[0], compact_now=[True],
+        num_new_tokens=[1],
+    )
+    assert worker.compact() == {"td": 3}
+    for name in LAYER_NAMES:
+        for plane in (0, 1):
+            for head in range(KV_HEADS):
+                actual = _read_slots(caches[name], slots[:3], plane)[:, head]
+                expected = _read_slots(originals[name], slots, plane)[
+                    kept[name][head], head
+                ]
+                assert torch.equal(actual, expected)

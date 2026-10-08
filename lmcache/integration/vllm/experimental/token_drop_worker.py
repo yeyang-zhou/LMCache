@@ -16,6 +16,37 @@ from lmcache.integration.vllm.token_drop import (
 )
 
 
+class KVView:
+    """Read-only request-local GPU KV access, materialized on demand."""
+
+    def __init__(
+        self, cache: torch.Tensor, blocks: torch.Tensor, offsets: torch.Tensor
+    ):
+        self._cache = cache
+        self._blocks = blocks
+        self._offsets = offsets
+        self._keys = None
+        self._values = None
+
+    def _read(self, plane: int) -> torch.Tensor:
+        return (
+            self._cache[:, plane][self._blocks, self._offsets]
+            .permute(1, 0, 2)
+            .contiguous()
+            .unsqueeze(0)
+        )
+
+    def get_keys(self) -> torch.Tensor:
+        if self._keys is None:
+            self._keys = self._read(0)
+        return self._keys
+
+    def get_values(self) -> torch.Tensor:
+        if self._values is None:
+            self._values = self._read(1)
+        return self._values
+
+
 class TokenDropWorker:
     """Forward request-local Q and apply algorithm-selected KV compaction."""
 
@@ -136,34 +167,26 @@ class TokenDropWorker:
             raise ValueError("Token dropping received invalid physical/query lengths")
 
         algorithms = [self._algorithm_from_state(state) for state in ordered_states]
-        observe_query = [
-            bool(
-                algorithm.should_observe_query(
-                    num_decoded_tokens=int(state.num_decoded_tokens),
-                    num_new_tokens=int(state.num_new_tokens),
-                    is_genuine_decode=bool(state.is_genuine_decode),
+        observe_counts = []
+        compact_now = []
+        for state, algorithm, physical_len in zip(
+            ordered_states, algorithms, physical_seq_lens, strict=True
+        ):
+            phase = "decode" if bool(state.is_genuine_decode) else "prefill"
+            decoded_before = int(state.num_decoded_tokens)
+            count = algorithm.should_observe_token_queries(phase, decoded_before)
+            if type(count) is not int or count < 0:
+                raise ValueError("Token-drop Q capture count must be nonnegative int")
+            observe_counts.append(min(count, int(state.num_new_tokens)))
+            compact_now.append(
+                bool(
+                    algorithm.should_compact_kv(
+                        phase, physical_len, decoded_before
+                    )
                 )
             )
-            for state, algorithm in zip(ordered_states, algorithms, strict=True)
-        ]
-        compact_now = [
-            bool(
-                algorithm.should_compact(
-                    resident_len=physical_len,
-                    num_decoded_tokens=int(state.num_decoded_tokens),
-                    num_new_tokens=int(state.num_new_tokens),
-                    is_genuine_decode=bool(state.is_genuine_decode),
-                )
-            )
-            for state, algorithm, physical_len in zip(
-                ordered_states,
-                algorithms,
-                physical_seq_lens,
-                strict=True,
-            )
-        ]
 
-        if not any(observe_query) and not any(compact_now):
+        if not any(observe_counts) and not any(compact_now):
             self.remove_query_hooks()
             self._clear_step()
             return
@@ -182,7 +205,7 @@ class TokenDropWorker:
         ):
             raise ValueError("Token-drop request/attention row mismatch")
 
-        if any(observe_query):
+        if any(observe_counts):
             self.install_query_hooks(forward_context.no_compile_layers)
         else:
             self.remove_query_hooks()
@@ -192,7 +215,7 @@ class TokenDropWorker:
             representative,
             physical_seq_lens=physical_seq_lens,
             request_rows=request_rows,
-            observe_query=observe_query,
+            observe_counts=observe_counts,
             compact_now=compact_now,
             num_new_tokens=query_lens,
         )
@@ -204,7 +227,7 @@ class TokenDropWorker:
         *,
         physical_seq_lens: list[int],
         request_rows: list[int] | None = None,
-        observe_query: list[bool] | None = None,
+        observe_counts: list[int] | None = None,
         compact_now: list[bool] | None = None,
         num_new_tokens: list[int] | None = None,
     ) -> None:
@@ -240,20 +263,20 @@ class TokenDropWorker:
             if num_new_tokens is None
             else list(num_new_tokens)
         )
-        observe_query = (
-            [False] * num_reqs if observe_query is None else list(observe_query)
+        observe_counts = (
+            [0] * num_reqs if observe_counts is None else list(observe_counts)
         )
         self._compact_now = (
             [False] * num_reqs if compact_now is None else list(compact_now)
         )
         if (
             len(self._num_new_tokens) != num_reqs
-            or len(observe_query) != num_reqs
+            or len(observe_counts) != num_reqs
             or len(self._compact_now) != num_reqs
         ):
             raise ValueError("Token-drop request/step fact count mismatch")
 
-        self._prepare_query_observation_plan(query_start_loc, observe_query)
+        self._prepare_query_observation_plan(query_start_loc, observe_counts)
         self._seq_lens = list(physical_seq_lens)
         self._block_table = attn_metadata.block_table
 
@@ -328,25 +351,27 @@ class TokenDropWorker:
     def _prepare_query_observation_plan(
         self,
         query_start_loc: torch.Tensor,
-        observe_query: list[bool],
+        observe_counts: list[int],
     ) -> None:
-        active: list[tuple[str, int, int]] = []
-        for request_id, worker_row, num_new_tokens, observe in zip(
+        active: list[tuple[str, int, int, int]] = []
+        for request_id, worker_row, num_new_tokens, count in zip(
             self._request_ids,
             self._request_rows,
             self._num_new_tokens or [],
-            observe_query,
+            observe_counts,
             strict=True,
         ):
-            if observe:
-                active.append((request_id, worker_row, int(num_new_tokens)))
+            if type(count) is not int or count < 0 or count > num_new_tokens:
+                raise ValueError("Token-drop invalid Q capture count")
+            if count:
+                active.append((request_id, worker_row, int(num_new_tokens), count))
 
         if not active:
             return
 
         device = query_start_loc.device
         rows = torch.as_tensor(
-            [worker_row for _, worker_row, _ in active],
+            [worker_row for _, worker_row, _, _ in active],
             dtype=torch.long,
             device=device,
         )
@@ -355,19 +380,19 @@ class TokenDropWorker:
         index_parts: list[torch.Tensor] = []
         slices: list[tuple[str, int, int]] = []
         offset = 0
-        for idx, (request_id, _, num_new_tokens) in enumerate(active):
+        for idx, (request_id, _, num_new_tokens, count) in enumerate(active):
             if num_new_tokens <= 0:
                 raise ValueError(
                     "Token-drop observation requires scheduled tokens for "
                     f"{request_id!r}"
                 )
             indices = (
-                torch.arange(num_new_tokens, dtype=torch.long, device=device)
-                + starts[idx]
+                torch.arange(count, dtype=torch.long, device=device)
+                + starts[idx] + num_new_tokens - count
             )
             index_parts.append(indices)
-            slices.append((request_id, offset, offset + num_new_tokens))
-            offset += num_new_tokens
+            slices.append((request_id, offset, offset + count))
+            offset += count
 
         self._query_observation_indices = torch.cat(index_parts)
         self._query_observation_slices = slices
@@ -397,7 +422,7 @@ class TokenDropWorker:
             return
 
         for request_id, start, end in self._query_observation_slices:
-            self._algorithm_for_request(request_id).observe_query(
+            self._algorithm_for_request(request_id).observe_token_queries(
                 {
                     layer_name: observed[start:end]
                     for layer_name, observed in self._observed_queries.items()
@@ -418,64 +443,67 @@ class TokenDropWorker:
         seq_len: int,
         algorithm: Any,
     ) -> int:
-        """Apply one algorithm-selected retained-position set to all KV layers."""
+        """Compact each KV head using the positions chosen for its own layer."""
+        from collections.abc import Mapping
+
         slots = self._slots_for_request(worker_row, seq_len)
         blocks = slots // self._block_size
         offsets = slots % self._block_size
-
-        layer_keys = {
-            name: (
-                self._kv_caches[name][:, 0][blocks, offsets]
-                .permute(1, 0, 2)
-                .unsqueeze(0)
-                .contiguous()
-            )
+        views = {
+            name: KVView(self._kv_caches[name], blocks, offsets)
             for name in self._layer_names
         }
-        kept = algorithm.select_kept_positions(layer_keys)
+        kept_by_layer = algorithm.select_kept_token_positions(views)
+        if not isinstance(kept_by_layer, Mapping):
+            raise RuntimeError("Token-drop algorithm must return positions by layer")
+        if set(kept_by_layer) != set(self._layer_names):
+            raise RuntimeError("Token-drop retained layer names mismatch")
 
-        if not isinstance(kept, torch.Tensor):
-            raise RuntimeError("Token-drop algorithm must return a tensor of positions")
-        if kept.device != slots.device:
-            raise RuntimeError("Token-drop kept positions must stay on the KV device")
-        if kept.ndim != 1 or kept.numel() == 0:
-            raise RuntimeError(
-                "Token-drop kept positions must be a non-empty 1-D tensor"
-            )
-        if kept.dtype not in (torch.int32, torch.int64):
-            raise RuntimeError(
-                "Token-drop kept positions must use an integer index dtype"
-            )
-        if kept.numel() > seq_len:
-            raise RuntimeError(
-                "Token-drop kept positions exceed the resident KV length"
-            )
-        if (kept < 0).any() or (kept >= seq_len).any():
-            raise RuntimeError(
-                "Token-drop kept positions are outside resident KV bounds"
-            )
-        if kept.numel() > 1 and not torch.all(kept[1:] > kept[:-1]):
-            raise RuntimeError(
-                "Token-drop kept positions must be unique and in logical order"
-            )
-
-        new_resident_len = int(kept.numel())
-        source_slots = slots[kept]
-        destination_slots = slots[:new_resident_len]
-        src_blocks = source_slots // self._block_size
-        src_offsets = source_slots % self._block_size
-        dst_blocks = destination_slots // self._block_size
-        dst_offsets = destination_slots % self._block_size
-
+        resident_len = None
         for name in self._layer_names:
-            key_cache = self._kv_caches[name][:, 0]
-            value_cache = self._kv_caches[name][:, 1]
-            kept_keys = key_cache[src_blocks, src_offsets]
-            kept_values = value_cache[src_blocks, src_offsets]
-            key_cache[dst_blocks, dst_offsets] = kept_keys
-            value_cache[dst_blocks, dst_offsets] = kept_values
+            indices = kept_by_layer[name]
+            kv_heads = int(self._kv_caches[name].shape[3])
+            if (
+                not isinstance(indices, torch.Tensor)
+                or indices.ndim != 2
+                or indices.shape[0] != kv_heads
+                or indices.device != slots.device
+                or indices.dtype not in (torch.int32, torch.int64)
+            ):
+                raise RuntimeError(
+                    "Token-drop positions must be [kv_heads, kept_tokens] "
+                    "integer tensors on the KV device"
+                )
+            count = int(indices.shape[1])
+            if count == 0 or count > seq_len:
+                raise RuntimeError("Token-drop invalid retained token count")
+            if resident_len is None:
+                resident_len = count
+            elif resident_len != count:
+                raise RuntimeError("All heads/layers must retain the same count")
+            if torch.any((indices < 0) | (indices >= seq_len)):
+                raise RuntimeError("Token-drop positions out of resident KV bounds")
+            for head_indices in indices:
+                if torch.unique(head_indices).numel() != count:
+                    raise RuntimeError("Token-drop retained positions must be unique")
 
-        return new_resident_len
+        assert resident_len is not None
+        destination = slots[:resident_len]
+        dst_blocks = destination // self._block_size
+        dst_offsets = destination % self._block_size
+        for name, view in views.items():
+            indices = kept_by_layer[name].long()
+            for plane, values in enumerate((view.get_keys(), view.get_values())):
+                # values: [1, kv_heads, current_tokens, head_dim]
+                per_head = values[0]
+                gather_idx = indices.unsqueeze(-1).expand(
+                    -1, -1, per_head.shape[-1]
+                )
+                retained = torch.gather(per_head, 1, gather_idx)
+                self._kv_caches[name][:, plane][dst_blocks, dst_offsets] = (
+                    retained.permute(1, 0, 2)
+                )
+        return resident_len
 
     def compact(self) -> dict[str, int]:
         if (
