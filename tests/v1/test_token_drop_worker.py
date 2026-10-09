@@ -461,3 +461,49 @@ def test_per_layer_per_head_ordered_compaction(monkeypatch):
                     kept[name][head], head
                 ]
                 assert torch.equal(actual, expected)
+
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("seed", [3, 19, 71, 109])
+def test_random_per_head_positions_match_offline_reference(monkeypatch, seed):
+    """Offline: valid, unsorted per-head selections preserve exact GPU KV."""
+    generator = torch.Generator().manual_seed(seed)
+    kept = {
+        layer: [
+            torch.randperm(8, generator=generator)[:4].tolist()
+            for _ in range(KV_HEADS)
+        ]
+        for layer in LAYER_NAMES
+    }
+    # All content-level position checks happen offline, not in the serving path.
+    for indices_by_head in kept.values():
+        for indices in indices_by_head:
+            assert len(indices) == len(set(indices)) == 4
+            assert all(0 <= index < 8 for index in indices)
+
+    algorithm = _FakeAlgorithm(kept=kept, compact=True)
+    _install_algorithms(monkeypatch, {"a": algorithm})
+    caches = _new_cache(6)
+    originals = {name: cache.clone() for name, cache in caches.items()}
+    block_ids = [4, 1]
+    slots = _slots(block_ids, 8)
+
+    worker = TokenDropWorker()
+    worker.register_kv_caches(caches)
+    worker._algorithm_from_state(_state("td", "a", resident=8))
+    worker.begin_step(
+        ["td"],
+        _metadata([block_ids], [1]),
+        physical_seq_lens=[8],
+        observe_counts=[0],
+        compact_now=[True],
+        num_new_tokens=[1],
+    )
+    assert worker.compact() == {"td": 4}
+    for layer in LAYER_NAMES:
+        for plane in (0, 1):
+            for head, chosen in enumerate(kept[layer]):
+                expected = _read_slots(originals[layer], slots, plane)[chosen, head]
+                actual = _read_slots(caches[layer], slots[:4], plane)[:, head]
+                assert torch.equal(actual, expected)

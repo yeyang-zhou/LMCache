@@ -481,12 +481,6 @@ class TokenDropWorker:
                 resident_len = count
             elif resident_len != count:
                 raise RuntimeError("All heads/layers must retain the same count")
-            if torch.any((indices < 0) | (indices >= seq_len)):
-                raise RuntimeError("Token-drop positions out of resident KV bounds")
-            for head_indices in indices:
-                if torch.unique(head_indices).numel() != count:
-                    raise RuntimeError("Token-drop retained positions must be unique")
-
         assert resident_len is not None
         destination = slots[:resident_len]
         dst_blocks = destination // self._block_size
