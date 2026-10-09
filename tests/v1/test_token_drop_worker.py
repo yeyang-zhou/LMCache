@@ -352,7 +352,7 @@ def test_two_algorithms_compact_independently_in_same_batch(monkeypatch):
         _metadata([[4, 1], [3, 2]], [1, 1]),
         physical_seq_lens=[8, 8],
         request_rows=[0, 1],
-        observe_counts=[0, False],
+        observe_counts=[0, 0],
         compact_now=[True, True],
         num_new_tokens=[1, 1],
     )
