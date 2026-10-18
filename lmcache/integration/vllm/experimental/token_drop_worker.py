@@ -430,6 +430,10 @@ class TokenDropWorker:
         )
 
     def _flush_query_observations(self) -> None:
+        if self._query_observation_slices and set(self._observed_queries) != set(
+            self._layer_names
+        ):
+            raise ValueError("Token-drop query capture missing attention layers")
         if not self._observed_queries:
             return
 

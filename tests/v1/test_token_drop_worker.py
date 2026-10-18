@@ -187,6 +187,36 @@ def test_query_observation_forwards_full_request_step_even_for_prefill(monkeypat
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("captured", [[], [LAYER_NAMES[0]]])
+def test_incomplete_query_capture_fails_before_kv_mutation(monkeypatch, captured):
+    algorithm = _FakeAlgorithm(kept=[0, 2, 4, 6], observe=True, compact=True)
+    _install_algorithms(monkeypatch, {"a": algorithm})
+
+    caches = _new_cache(4)
+    before = {name: cache.clone() for name, cache in caches.items()}
+    worker = TokenDropWorker()
+    worker.register_kv_caches(caches)
+    worker._algorithm_from_state(_state("td", "a", resident=8))
+    worker.begin_step(
+        ["td"],
+        _metadata([[3, 1]], [1]),
+        physical_seq_lens=[8],
+        observe_counts=[1],
+        compact_now=[True],
+        num_new_tokens=[1],
+    )
+
+    for name in captured:
+        worker.capture_query(name, torch.randn(1, Q_HEADS, HEAD_DIM, device="cuda"))
+
+    with pytest.raises(ValueError, match="query capture missing attention layers"):
+        worker.compact()
+    assert algorithm.observation_batches == []
+    assert algorithm.selection_inputs == []
+    for name, cache in caches.items():
+        assert torch.equal(cache, before[name])
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_idle_step_skips_attention_metadata_and_worker_state(monkeypatch):
     algorithm = _FakeAlgorithm(observe=False, compact=False)
     _install_algorithms(monkeypatch, {"a": algorithm})
