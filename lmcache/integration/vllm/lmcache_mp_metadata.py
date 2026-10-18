@@ -441,6 +441,7 @@ class LMCacheMPTokenDropRequestState:
     num_decoded_tokens: int = 0
     num_new_tokens: int = 0
     worker_row: int = -1
+    private_blocks_validated: bool = False
 
 
 class LMCacheMPConnectorMetadata(KVConnectorMetadata):
@@ -455,7 +456,11 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
         self.requests.append(request_metadata)
 
     def __len__(self):
-        return len(self.requests)
+        return (
+            len(self.requests)
+            + len(self.token_drop_requests)
+            + len(self.token_drop_reset_ids)
+        )
 
     # For debugging
     def __str__(self):

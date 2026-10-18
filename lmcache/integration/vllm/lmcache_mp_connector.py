@@ -54,6 +54,7 @@ import zmq
 # First Party
 from lmcache.banner import print_banner_once
 from lmcache.integration.vllm.experimental import dispatch
+from lmcache.integration.vllm.experimental.token_drop_worker import TokenDropWorker
 from lmcache.integration.vllm.kv_cache_group_edits import (
     apply_kv_cache_group_edits,
     validate_kv_cache_groups,
@@ -69,6 +70,7 @@ from lmcache.integration.vllm.lmcache_mp_metadata import (
     LMCacheMPRequestMetadata,
     LMCacheMPRequestState,
     LMCacheMPRequestTracker,
+    LMCacheMPTokenDropRequestState,
     LMCacheMPWorkerMetadata,
 )
 from lmcache.integration.vllm.lmcache_mp_metrics import (
@@ -85,6 +87,9 @@ from lmcache.integration.vllm.token_drop_allocator_adapter import (
     set_resident_kv_tokens,
 )
 from lmcache.integration.vllm.token_drop_apc_adapter import install_token_drop_apc_guard
+from lmcache.integration.vllm.token_drop_worker_adapter import (
+    install_token_drop_worker_adapter,
+)
 from lmcache.integration.vllm.utils import (
     mla_only,
     vllm_layout_hints,
@@ -771,6 +776,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             local_server_url = server_urls[
                 parallel_strategy.vllm_worker_id // ranks_per_node
             ]
+            self._token_drop_worker = TokenDropWorker()
+            self._pending_token_drop_updates: dict[str, int] = {}
             self.worker_adapter = LMCacheMPWorkerAdapter(
                 server_url=local_server_url,
                 context=zmq_context,
@@ -898,6 +905,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             engine_group_infos=engine_group_infos,
             layout_hints=layout_hints,
         )
+        self._token_drop_worker.register_kv_caches(kv_caches)
+        # Install before vLLM prepares its model inputs. Non-TD is passthrough.
+        # Third Party
+        from vllm.version import __version__ as vllm_version
+
+        if vllm_version.split("+", 1)[0] == "0.25.1":
+            install_token_drop_worker_adapter()
         if self.dispatcher is not None:
             dispatch(
                 self.dispatcher,
@@ -925,6 +939,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
+        self._token_drop_worker.prepare_forward(
+            forward_context, metadata.token_drop_requests
+        )
 
         request_ids = []
         ops = []
@@ -1005,6 +1022,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
+        updates = self._token_drop_worker.compact()
+        for request_id, length in updates.items():
+            if request_id in self._pending_token_drop_updates:
+                raise RuntimeError(
+                    "Duplicate token-drop resident output before publication"
+                )
+            self._pending_token_drop_updates[request_id] = length
 
         request_ids = []
         ops = []
@@ -1057,6 +1081,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             and kv_connector_metadata.need_flush_before_forward
         )
         worker_adapter.handle_preemptions(need_flush_before_forward)
+        if isinstance(kv_connector_metadata, LMCacheMPConnectorMetadata):
+            self._token_drop_worker.drop_requests(
+                kv_connector_metadata.token_drop_reset_ids
+            )
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -1074,6 +1102,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
         """
+        self._token_drop_worker.drop_requests(finished_req_ids)
         if self.lazy_offload:
             val = self.worker_adapter.get_finished_with_lazy_offload()
         else:
@@ -1130,19 +1159,29 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             else self.get_kv_connector_kv_cache_events()
         )
         self._kv_events_hook_called = False
+        resident_updates = self._pending_token_drop_updates
+        self._pending_token_drop_updates = {}
         if not self.lazy_offload:
-            if kv_events is None:
+            if kv_events is None and not resident_updates:
                 return None
             return LMCacheMPWorkerMetadata(
-                completed_store_requests={}, kv_events=kv_events
+                completed_store_requests={},
+                kv_events=kv_events,
+                resident_kv_updates=resident_updates,
             )
         completed_store_requests = self.worker_adapter.get_completed_store_requests()
         failed_store_requests = self.worker_adapter.get_failed_store_requests()
-        if completed_store_requests or failed_store_requests or kv_events:
+        if (
+            completed_store_requests
+            or failed_store_requests
+            or kv_events
+            or resident_updates
+        ):
             return LMCacheMPWorkerMetadata(
                 completed_store_requests=completed_store_requests or {},
                 failed_store_requests=failed_store_requests or set(),
                 kv_events=kv_events,
+                resident_kv_updates=resident_updates,
             )
         else:
             return None
@@ -1642,6 +1681,49 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                     free_end,
                 )
 
+    def _add_token_drop_states(
+        self, scheduler_output: SchedulerOutput, metadata: LMCacheMPConnectorMetadata
+    ) -> None:
+        # Publish scheduler-owned resident P and private block IDs to the worker.
+        request_ids = [
+            req.req_id for req in scheduler_output.scheduled_new_reqs
+        ] + list(scheduler_output.scheduled_cached_reqs.req_ids)
+        for request_id in request_ids:
+            tracker = self.request_trackers.get(request_id)
+            if tracker is None or tracker.token_drop_spec is None:
+                continue
+            scheduled = int(scheduler_output.num_scheduled_tokens[request_id])
+            if scheduled <= 0:
+                raise RuntimeError("Token-drop step must schedule at least one token")
+            blocks = self._require_private_token_drop_blocks(request_id)
+            resident = get_resident_kv_tokens(request_id)
+            has_override = resident is not None
+            if resident is None:
+                resident = tracker.num_scheduled_tokens
+            if resident < scheduled:
+                raise RuntimeError("Token-drop resident frontier precedes scheduled KV")
+            logical_before = tracker.num_scheduled_tokens - scheduled
+            metadata.token_drop_requests.append(
+                LMCacheMPTokenDropRequestState(
+                    request_id=request_id,
+                    algorithm=tracker.token_drop_spec.algorithm,
+                    config=dict(tracker.token_drop_spec.config),
+                    resident_kv_tokens=resident,
+                    has_physical_override=has_override,
+                    physical_block_ids=(
+                        [block.block_id for block in blocks] if has_override else None
+                    ),
+                    is_genuine_decode=(
+                        logical_before >= tracker.num_prompt_tokens and scheduled == 1
+                    ),
+                    num_decoded_tokens=max(
+                        0, logical_before - tracker.num_prompt_tokens
+                    ),
+                    num_new_tokens=scheduled,
+                    private_blocks_validated=True,
+                )
+            )
+
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
@@ -1667,6 +1749,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
         self._process_cached_requests(scheduler_output, metadata)
+        self._add_token_drop_states(scheduler_output, metadata)
 
         if self.lazy_offload:
             actions = self._lazy_offload_manager.on_scheduler_step(scheduler_output)
