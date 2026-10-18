@@ -546,3 +546,43 @@ def test_observation_error_falls_back_before_any_kv_write(monkeypatch):
     assert worker.compact() == {}
     for name, cache in caches.items():
         assert torch.equal(cache, before[name])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_post_write_gpu_compaction_failure_is_not_swallowed(monkeypatch):
+    algorithm = _FakeAlgorithm(kept=[1, 3, 4, 7], compact=True)
+    _install_algorithms(monkeypatch, {"a": algorithm})
+    caches = _new_cache(4)
+    original = {name: cache.clone() for name, cache in caches.items()}
+
+    worker = TokenDropWorker()
+    worker.register_kv_caches(caches)
+    worker._algorithm_from_state(_state("td", "a", resident=8))
+    worker.begin_step(
+        ["td"],
+        _metadata([[3, 1]], [1]),
+        physical_seq_lens=[8],
+        observe_counts=[0],
+        compact_now=[True],
+        num_new_tokens=[1],
+    )
+
+    original_compact = worker_mod.PagedKVSequenceView.compact_kv_in_place
+    wrote = []
+
+    def write_then_fail(self, kept_positions):
+        original_compact(self, kept_positions)
+        wrote.append(True)
+        raise RuntimeError("injected post-write failure")
+
+    monkeypatch.setattr(
+        worker_mod.PagedKVSequenceView,
+        "compact_kv_in_place",
+        write_then_fail,
+    )
+
+    with pytest.raises(RuntimeError, match="injected post-write failure"):
+        worker.compact()
+
+    assert wrote
+    assert any(not torch.equal(cache, original[name]) for name, cache in caches.items())

@@ -47,14 +47,14 @@ Revisions: LMCache AIO feature commit 7038c264; R-KV PR #64 e6c9ccc. GPU: H100 8
 ### Correctness results
 
 - R-KV CUDA serving and scoring tests: 52 PASS; cross-repo frozen paged GPU KV primitive parity against legacy dense R-KV passed for FP16/BF16 and non-contiguous input K.
-- Full LMCache token-drop suite: 115 PASS, zero failures. Six added admission tests cover unsupported chunked prefill, speculation, async scheduling, multi-GPU, multi-group KV, and successful adaptor installation.
+- Full LMCache token-drop suite: 116 PASS, zero failures. Six added admission tests cover unsupported chunked prefill, speculation, async scheduling, multi-GPU, multi-group KV, and successful adaptor installation. A CUDA-only fault-injection test confirms that an exception raised after a real in-place GPU KV write propagates rather than being swallowed.
 - Real vLLM eager E2E: vanilla, normal-only, TD-only, and mixed normal+TD all generate successfully. APC-enabled mixed also passes; in each mixed repeat, normal-request generated tokens match vanilla.
 - Long-context APC mixed: 4 requests, 2 normal and 2 TD, 512 prompt + 512 output tokens, 2 repeats, 32 observed compactions, both completed.
 - Real PIECEWISE CUDA Graph: mixed 2 requests x 96 output tokens (3 compactions), and TD-only 4 requests x 256 output tokens (32 compactions) both completed with actual compilation and graph capture.
 - Mixed-batch crash root cause: engine-finished TD request IDs were erroneously re-reported as LMCache STORE finished_sending; the fix excludes TD completion from LMCache STORE receipts but preserves normal completion. Live failing case reproduced before the fix; live mixed case and new regression tests pass after it.
 - Repeated TD-only E2E: 96 compactions over 3 runs. Repeated mixed eager: 48 compactions. Repeated mixed + APC: 48 compactions.
 - Important caveat: 1 of 12 normal-only generated outputs differs from vanilla (first repeat, first request), reproducibly. Untouched upstream LMCache commit 663757e3 produces precisely the same output hash, so it is not introduced by AIO; the underlying upstream discrepancy is still open.
-- Unit tests cover private allocation, preemption metadata/reset, fail-fast, worker/scheduler P ownership, post-compaction completion barrier, per-layer/per-head movement, and prewrite recoverable errors. Live forced-preemption, injected GPU failure during destructive writes, and long-duration soak are NOT verified.
+- Unit tests cover private allocation, preemption metadata/reset, fail-fast, worker/scheduler P ownership, post-compaction completion barrier, per-layer/per-head movement, and prewrite recoverable errors. Live forced-preemption, end-to-end fault injection/recovery, and long-duration soak are NOT verified.
 
 ### Performance results and RCA
 
