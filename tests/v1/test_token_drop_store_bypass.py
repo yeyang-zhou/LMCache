@@ -109,6 +109,8 @@ def test_token_drop_finish_runs_lazy_registry_cleanup() -> None:
             )
         },
         _cleanup_request_tracker=MagicMock(),
+        _token_drop_allocations={},
+        _token_drop_finished_before_output=set(),
         scheduler_adapter=MagicMock(),
         lazy_offload=True,
         _lazy_offload_manager=manager,
@@ -164,6 +166,8 @@ def test_normal_pending_store_is_discarded_when_token_drop_reuses_id() -> None:
         _lazy_offload_manager=manager,
         scheduler_adapter=MagicMock(),
         _can_store=True,
+        _token_drop_allocations={},
+        _token_drop_finished_before_output=set(),
     )
     connector._cleanup_request_tracker = lambda rid: connector.request_trackers.pop(
         rid, None

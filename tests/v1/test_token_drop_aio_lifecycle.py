@@ -142,3 +142,39 @@ def test_reset_only_meta_counts_as_nonempty():
     assert len(metadata) == 0
     metadata.token_drop_reset_ids.add("td")
     assert len(metadata) == 1
+
+
+@pytest.mark.parametrize(
+    ("finished", "expected_stores"),
+    [
+        ({"normal", "td"}, {"normal"}),
+        ({"td"}, set()),
+        ({"normal"}, {"normal"}),
+    ],
+)
+def test_worker_completion_excludes_token_drop_without_hiding_normal_store(
+    finished, expected_stores
+):
+    # vLLM has already reclaimed TD's private KV blocks at request_finished().
+    # Reporting that ID as finished_sending would crash the scheduler.
+    forwarded = []
+    cleaned = []
+
+    def from_adapter(ids):
+        forwarded.append(set(ids))
+        return set(ids), set()
+
+    worker = SimpleNamespace(
+        lazy_offload=False,
+        _can_store=True,
+        worker_adapter=SimpleNamespace(get_finished=from_adapter),
+        _token_drop_worker=SimpleNamespace(
+            is_token_drop_request=lambda rid: rid == "td",
+            drop_requests=lambda ids: cleaned.extend(ids),
+        ),
+    )
+    sending, receiving = LMCacheMPConnector.get_finished(worker, finished)
+    assert sending == expected_stores
+    assert receiving == set()
+    assert forwarded == [expected_stores]
+    assert set(cleaned) == finished

@@ -36,6 +36,7 @@ def make_connector(spec):
         _eager_prefetch=True,
         _reserve_last_token_for_lookup=False,
         _get_or_create_request_tracker=lambda request: tracker,
+        _admit_token_drop_request=MagicMock(),
         scheduler_adapter=adapter,
     )
     request = SimpleNamespace(request_id="req", resumable=False)
@@ -45,6 +46,7 @@ def make_connector(spec):
 def test_token_drop_skips_eager_and_scheduler_lookup() -> None:
     connector, request, adapter = make_connector(TokenDropSpec("rkv", {}))
     LMCacheMPConnector.on_new_request(connector, request)
+    connector._admit_token_drop_request.assert_called_once_with(request)
     assert LMCacheMPConnector.get_num_new_matched_tokens(connector, request, 0) == (
         0,
         False,

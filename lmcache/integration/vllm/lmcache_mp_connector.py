@@ -1102,6 +1102,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             The finished saves/sends req ids must belong to a set provided in a
             call to this method (this call or a prior one).
         """
+        # vLLM already released finished TD requests: they must not be
+        # acknowledged again as completed LMCache STORE transfers.
+        token_drop_finished = {
+            request_id
+            for request_id in finished_req_ids
+            if self._token_drop_worker.is_token_drop_request(request_id)
+        }
         self._token_drop_worker.drop_requests(finished_req_ids)
         if self.lazy_offload:
             val = self.worker_adapter.get_finished_with_lazy_offload()
@@ -1109,7 +1116,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             # The adapter reports engine-finished IDs even without a STORE.
             # Consumers never delay frees for saves, but must still poll retrieves.
             val = self.worker_adapter.get_finished(
-                finished_req_ids if self._can_store else set()
+                (finished_req_ids - token_drop_finished) if self._can_store else set()
             )
         # logger.error("Finished req ids: %s, %s", val[0], val[1])
         return val
