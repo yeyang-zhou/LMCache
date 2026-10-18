@@ -54,7 +54,7 @@ Revisions: LMCache AIO feature commit 7038c264; R-KV PR #64 e6c9ccc. GPU: H100 8
 - Mixed-batch crash root cause: engine-finished TD request IDs were erroneously re-reported as LMCache STORE finished_sending; the fix excludes TD completion from LMCache STORE receipts but preserves normal completion. Live failing case reproduced before the fix; live mixed case and new regression tests pass after it.
 - Repeated TD-only E2E: 96 compactions over 3 runs. Repeated mixed eager: 48 compactions. Repeated mixed + APC: 48 compactions.
 - Important caveat: 1 of 12 normal-only generated outputs differs from vanilla (first repeat, first request), reproducibly. Untouched upstream LMCache commit 663757e3 produces precisely the same output hash, so it is not introduced by AIO; the underlying upstream discrepancy is still open.
-- Unit tests cover private allocation, preemption metadata/reset, fail-fast, worker/scheduler P ownership, post-compaction completion barrier, per-layer/per-head movement, and prewrite recoverable errors. Live forced-preemption, end-to-end fault injection/recovery, and long-duration soak are NOT verified.
+- Unit tests cover private allocation, preemption metadata/reset, fail-fast, worker/scheduler P ownership, post-compaction completion barrier, per-layer/per-head movement, and prewrite recoverable errors. A live mixed-batch run with vLLM KV-cache memory capped at 64 MiB actually preempted and resumed normal requests, completed generation, and performed 16 TD compactions. TD-specific preemption was not observed in the separate TD-only forced-cap runs; that specific resume path, end-to-end post-write fault recovery, and long-duration soak remain unverified.
 
 ### Performance results and RCA
 
