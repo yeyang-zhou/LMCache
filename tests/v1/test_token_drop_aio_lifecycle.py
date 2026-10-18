@@ -54,6 +54,76 @@ def _scheduler(*, logical=65, prompt=64):
     return scheduler, output
 
 
+def _admission_connector():
+    cfg = SimpleNamespace(
+        scheduler_config=SimpleNamespace(
+            enable_chunked_prefill=False, async_scheduling=False
+        ),
+        speculative_config=None,
+        parallel_config=SimpleNamespace(world_size=1),
+    )
+    connector = SimpleNamespace(
+        _vllm_config=cfg,
+        _group_tokens_per_block=[16],
+    )
+    request = SimpleNamespace(skip_reading_prefix_cache=False)
+    return connector, request
+
+
+@pytest.mark.parametrize(
+    ("kind", "error"),
+    [
+        ("chunked", "chunked prefill"),
+        ("speculative", "speculative decoding"),
+        ("async", "synchronous scheduling"),
+        ("parallel", "single GPU"),
+        ("groups", "one KV cache group"),
+    ],
+)
+def test_unsupported_td_is_rejected_before_installing_adaptors(
+    kind, error, monkeypatch
+):
+    connector, request = _admission_connector()
+    cfg = connector._vllm_config
+    if kind == "chunked":
+        cfg.scheduler_config.enable_chunked_prefill = True
+    elif kind == "speculative":
+        cfg.speculative_config = object()
+    elif kind == "async":
+        cfg.scheduler_config.async_scheduling = True
+    elif kind == "parallel":
+        cfg.parallel_config.world_size = 2
+    else:
+        connector._group_tokens_per_block = [16, 16]
+
+    def forbidden():
+        raise AssertionError("Adaptor installed before admission validated")
+
+    monkeypatch.setattr(
+        "lmcache.integration.vllm.lmcache_mp_connector.install_token_drop_apc_guard",
+        forbidden,
+    )
+    with pytest.raises(ValueError, match=error):
+        LMCacheMPConnector._admit_token_drop_request(connector, request)
+    assert request.skip_reading_prefix_cache is False
+
+
+def test_supported_td_admission_installs_both_adaptors(monkeypatch):
+    connector, request = _admission_connector()
+    called = []
+    monkeypatch.setattr(
+        "lmcache.integration.vllm.lmcache_mp_connector.install_token_drop_apc_guard",
+        lambda: called.append("apc"),
+    )
+    monkeypatch.setattr(
+        "lmcache.integration.vllm.lmcache_mp_connector.install_token_drop_allocator_adapter",
+        lambda: called.append("allocator"),
+    )
+    LMCacheMPConnector._admit_token_drop_request(connector, request)
+    assert called == ["apc", "allocator"]
+    assert request.skip_reading_prefix_cache is True
+
+
 def test_publish_private_resident_frontier_and_decode_facts():
     scheduler, output = _scheduler()
     set_resident_kv_tokens("td", 33)
