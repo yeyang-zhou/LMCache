@@ -74,8 +74,8 @@ class LMCacheMPTokenDropRequestState:
     algorithm: str
     config: dict[str, Any]
     resident_kv_tokens: int
-    physical_block_ids: list[int] | None = None
-    is_genuine_decode: bool = False
-    num_decoded_tokens: int = 0
-    num_new_tokens: int = 0
+    physical_block_ids: list[int] | None
+    is_genuine_decode: bool
+    num_decoded_tokens: int
+    num_new_tokens: int
     worker_row: int = -1

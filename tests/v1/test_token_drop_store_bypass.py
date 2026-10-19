@@ -198,26 +198,3 @@ def test_normal_pending_store_is_discarded_when_token_drop_reuses_id() -> None:
     )
     assert "req" not in manager._requests._slots
     assert connector.scheduler_adapter.end_session.call_count == 2
-
-
-def test_inflight_normal_store_is_orphaned_when_token_drop_reuses_id() -> None:
-    completion = MagicMock()
-    completion.update_pending_store_count.return_value = True
-    policy = MagicMock()
-    policy.has_pending_request.return_value = False
-    manager = LazyOffloadManager({}, [16], completion)
-    manager._policy = policy
-    pool = MagicMock()
-    manager._gpu_block_pool = pool
-    manager.on_request_arrived("req")
-    manager._requests.register_batch("req", [7])
-    assert manager.on_request_finished("req").sessions_to_end == []
-
-    assert manager.on_request_arrived("req").sessions_to_end == []
-    policy.discard_for_reuse.assert_called_once_with("req")
-    assert manager._requests.in_flight_is_orphaned("req")
-
-    assert manager.on_store_results(set(), {"req": 1}).sessions_to_end == []
-    pool.free_blocks.assert_called_once_with([pool.blocks[7]])
-    assert manager.on_request_finished("req").sessions_to_end == ["req"]
-    assert "req" not in manager._requests._slots

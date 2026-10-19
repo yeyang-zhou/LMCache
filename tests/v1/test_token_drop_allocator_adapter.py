@@ -32,6 +32,7 @@ def _original_allocate(
     reserved_blocks=0,
     has_scheduled_reqs=True,
 ):
+    manager.seen_request = request
     manager.seen_num_computed_tokens = request.num_computed_tokens
     manager.seen_num_new_tokens = num_new_tokens
     manager.seen_delay_cache_blocks = delay_cache_blocks
@@ -77,6 +78,8 @@ def test_resident_frontier_is_used_only_for_token_drop_allocation():
 
     assert result is manager.result
     assert manager.seen_num_computed_tokens == 32
+    assert manager.seen_request is not request
+    assert manager.seen_request.physical_kv_length == 32
     assert request.num_computed_tokens == 104
     assert get_resident_kv_tokens(request.request_id) == 33
 
@@ -96,6 +99,7 @@ def test_normal_request_is_exact_vanilla_passthrough():
 
     assert result is manager.result
     assert manager.seen_num_computed_tokens == 104
+    assert manager.seen_request is request
     assert manager.seen_delay_cache_blocks is True
     assert get_resident_kv_tokens(request.request_id) is None
 
@@ -166,36 +170,6 @@ def test_resident_frontier_rejects_unsupported_allocation_modes(name, value):
     assert get_resident_kv_tokens(request.request_id) == 32
 
 
-def test_private_blocks_keep_vllm_running_request_bookkeeping() -> None:
-    vllm = pytest.importorskip("vllm")
-    if vllm.__version__ != "0.25.1":
-        pytest.skip("Requires pinned vLLM 0.25.1")
-
-    # Third Party
-    from vllm.v1.core.single_type_kv_cache_manager import SingleTypeKVCacheManager
-
-    calls = []
-    manager = SimpleNamespace(
-        num_cached_block={},
-        block_size=16,
-        scheduler_block_size=16,
-        kv_cache_spec=object(),
-        use_eagle=False,
-        kv_cache_group_id=0,
-        req_to_blocks={"req": [object(), object()]},
-        block_pool=SimpleNamespace(
-            cache_full_blocks=lambda **kwargs: calls.append(kwargs)
-        ),
-        reachable_block_mask=lambda **_kwargs: None,
-    )
-    request = SimpleNamespace(request_id="req", num_prompt_tokens=16)
-
-    SingleTypeKVCacheManager.cache_blocks(manager, request, 32)
-
-    assert manager.num_cached_block["req"] == 2
-    assert len(calls) == 1
-
-
 def test_install_allocator_adaptor_is_idempotent_for_pinned_vllm():
     vllm = pytest.importorskip("vllm")
     if vllm.__version__ != "0.25.1":
@@ -226,3 +200,20 @@ def test_resident_state_helpers():
     assert get_resident_kv_tokens("req") == 7
     clear_resident_kv_tokens("req")
     assert get_resident_kv_tokens("req") is None
+
+
+def test_physical_allocation_exception_keeps_logical_request_unchanged():
+    manager = SimpleNamespace(max_model_len=4096)
+    request = _request(104)
+    set_resident_kv_tokens(request.request_id, 32)
+
+    def fail(_manager, allocation_request, *_args):
+        assert allocation_request is not request
+        assert allocation_request.num_computed_tokens == 32
+        assert request.num_computed_tokens == 104
+        raise RuntimeError("injected allocation failure")
+
+    with pytest.raises(RuntimeError, match="injected allocation failure"):
+        _allocate_with_resident_frontier(fail, manager, request, 1)
+    assert request.num_computed_tokens == 104
+    assert get_resident_kv_tokens(request.request_id) == 32

@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """vLLM 0.25.1 token-dropping adaptor: scheduler, worker and attention hooks."""
 
+# Future
 from __future__ import annotations
 
+# Standard
 from collections.abc import Callable
 from contextvars import ContextVar
 from functools import wraps
 from typing import TYPE_CHECKING, Any
 
+# Third Party
 import numpy as np
 import torch
 
+# First Party
 from lmcache.integration.vllm.experimental.token_drop_scheduler import (
     clear_resident_kv_tokens,
     get_resident_kv_tokens,
@@ -19,6 +23,7 @@ from lmcache.integration.vllm.experimental.token_drop_scheduler import (
 from lmcache.integration.vllm.utils import extract_request_configs_from_request
 
 if TYPE_CHECKING:
+    # Third Party
     from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
     from vllm.model_executor.layers.attention.attention import Attention
     from vllm.v1.attention.backends.flash_attn import (
@@ -33,6 +38,7 @@ if TYPE_CHECKING:
     from vllm.v1.worker.block_table import MultiGroupBlockTable
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+    # First Party
     from lmcache.integration.vllm.experimental.token_drop import (
         LMCacheMPTokenDropRequestState,
     )
@@ -42,6 +48,7 @@ _SUPPORTED_VLLM_VERSION = "0.25.1"
 
 
 def _check_vllm_version() -> None:
+    # Third Party
     from vllm.version import __version__ as vllm_version
 
     if vllm_version.split("+", 1)[0] != _SUPPORTED_VLLM_VERSION:
@@ -49,6 +56,21 @@ def _check_vllm_version() -> None:
             f"Token dropping requires vLLM {_SUPPORTED_VLLM_VERSION}, "
             f"got {vllm_version}"
         )
+
+
+class _PhysicalKVRequestView:
+    """Expose resident KV length to the allocator without mutating the request."""
+
+    def __init__(self, request: Request, physical_kv_length: int):
+        self._request = request
+        self.physical_kv_length = physical_kv_length
+
+    @property
+    def num_computed_tokens(self) -> int:
+        return self.physical_kv_length
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._request, name)
 
 
 def _allocate_with_resident_frontier(
@@ -91,31 +113,33 @@ def _allocate_with_resident_frontier(
             "full-attention decoding"
         )
 
-    logical = request.num_computed_tokens
     if use_physical:
-        request.num_computed_tokens = resident
-    try:
-        result = original(
-            manager,
-            request,
-            num_new_tokens,
-            num_new_computed_tokens,
-            new_computed_blocks,
-            num_lookahead_tokens,
-            num_external_computed_tokens,
-            delay_cache_blocks,
-            num_encoder_tokens,
-            full_sequence_must_fit,
-            reserved_blocks,
-            has_scheduled_reqs,
-        )
-    finally:
-        if use_physical:
-            request.num_computed_tokens = logical
+        assert resident is not None
+        allocation_request = _PhysicalKVRequestView(request, resident)
+    else:
+        allocation_request = request
+    result = original(
+        manager,
+        allocation_request,
+        num_new_tokens,
+        num_new_computed_tokens,
+        new_computed_blocks,
+        num_lookahead_tokens,
+        num_external_computed_tokens,
+        delay_cache_blocks,
+        num_encoder_tokens,
+        full_sequence_must_fit,
+        reserved_blocks,
+        has_scheduled_reqs,
+    )
 
     if use_physical and result is not None:
         set_resident_kv_tokens(
-            request_id, min(resident + num_new_tokens, manager.max_model_len)
+            request_id,
+            min(
+                allocation_request.num_computed_tokens + num_new_tokens,
+                manager.max_model_len,
+            ),
         )
     return result
 
@@ -180,12 +204,12 @@ def _find_token_drop_requests(
         return None
 
     requests = getattr(metadata, "token_drop_requests", None)
-    if requests is not None:
+    if requests:
         return requests
 
     for child in getattr(metadata, "metadata", ()):
         found = _find_token_drop_requests(child)
-        if found is not None:
+        if found:
             return found
     return None
 
@@ -226,14 +250,11 @@ def _prepare_inputs_with_physical_frontier(
             f"Token-drop metadata has requests absent from worker batch: {extra}"
         )
 
-    # Keep only token-dropping requests in this list, but order those sparse
-    # rows exactly like the model-runner batch. Normal rows remain vanilla.
-    ordered = sorted(requests, key=lambda state: row_by_request_id[state.request_id])
-    for state in ordered:
+    # The transport metadata order need not match the model-runner batch.
+    for state in requests:
         state.worker_row = row_by_request_id[state.request_id]
-    requests[:] = ordered
 
-    if not any(state.physical_block_ids is not None for state in ordered):
+    if not any(state.physical_block_ids is not None for state in requests):
         return original(runner, scheduler_output, num_scheduled_tokens)
 
     physical_positions, physical_seq_lens = _ensure_physical_buffers(runner)
@@ -284,12 +305,14 @@ def _prepare_inputs_with_physical_frontier(
     finally:
         _slot_mapping_override.reset(token)
 
-    # RoPE/model positions remain logical. KV-facing lengths use P only for
-    # token-dropping rows; normal rows are copied back with their vanilla L.
-    runner.seq_lens[:num_reqs].copy_(
-        physical_seq_lens.gpu[:num_reqs],
-        non_blocking=True,
-    )
+    # Keep model/RoPE positions and every normal request's seq_lens untouched.
+    for state in requests:
+        if state.physical_block_ids is not None:
+            row = state.worker_row
+            runner.seq_lens[row : row + 1].copy_(
+                physical_seq_lens.gpu[row : row + 1],
+                non_blocking=True,
+            )
     return result
 
 
@@ -368,12 +391,14 @@ def install_query_hooks(worker, no_compile_layers: dict[str, "Attention"]) -> No
         return
 
     originals: dict[str, tuple[FlashAttentionImpl, Callable[..., torch.Tensor]]] = {}
-    for layer_name in worker._layer_names:
+    for layer_name in worker._kv_caches:
         layer = no_compile_layers[layer_name]
-        impl = getattr(layer, "impl", None)
+        impl = layer.impl
         original_forward = impl.forward
         originals[layer_name] = (impl, original_forward)
 
+    # Record originals before mutation so partial installs can be rolled back.
+    worker._query_hook_originals = originals
     for impl, forward_impl in originals.values():
 
         def forward_with_query_capture(
@@ -407,9 +432,11 @@ def install_query_hooks(worker, no_compile_layers: dict[str, "Attention"]) -> No
                 **kwargs,
             )
 
-        setattr(impl, "forward", forward_with_query_capture)  # noqa: B010
-
-    worker._query_hook_originals = originals
+        try:
+            setattr(impl, "forward", forward_with_query_capture)  # noqa: B010
+        except Exception:
+            remove_query_hooks(worker)
+            raise
 
 
 def remove_query_hooks(worker) -> None:

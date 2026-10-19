@@ -663,3 +663,70 @@ def test_post_write_gpu_compaction_failure_is_not_swallowed(monkeypatch):
 
     assert wrote
     assert any(not torch.equal(cache, original[name]) for name, cache in caches.items())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_failed_step_validation_leaves_no_attention_hooks(monkeypatch):
+    algorithm = _FakeAlgorithm(observe=True)
+    _install_algorithms(monkeypatch, {"a": algorithm})
+    worker = TokenDropWorker()
+    worker.register_kv_caches(_new_cache(4))
+    state = _state("td", "a", resident=8)
+    metadata = _metadata([[3, 1]], [1])
+    metadata.use_cascade = True
+    layers = {}
+    originals = {}
+    for name in LAYER_NAMES:
+
+        def forward(*_args):
+            return None
+
+        originals[name] = forward
+        layers[name] = SimpleNamespace(impl=SimpleNamespace(forward=forward))
+    ctx = SimpleNamespace(attn_metadata={"group": metadata}, no_compile_layers=layers)
+
+    with pytest.raises(ValueError, match="cascade attention"):
+        worker.prepare_forward(ctx, [state])
+    assert worker._query_hook_originals == {}
+    assert worker._seq_lens is None
+    assert worker._query_observation_indices is None
+    assert all(layers[name].impl.forward is originals[name] for name in LAYER_NAMES)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_partial_attention_hook_installation_is_rolled_back(monkeypatch):
+    algorithm = _FakeAlgorithm(observe=True)
+    _install_algorithms(monkeypatch, {"a": algorithm})
+    worker = TokenDropWorker()
+    worker.register_kv_caches(_new_cache(4))
+
+    def forward(*_args):
+        return None
+
+    class _RejectReplacement:
+        def __init__(self):
+            self.forward = forward
+
+        def __setattr__(self, name, value):
+            if name == "forward" and hasattr(self, "forward") and value is not forward:
+                raise RuntimeError("injected hook installation failure")
+            super().__setattr__(name, value)
+
+    first = SimpleNamespace(forward=forward)
+    second = _RejectReplacement()
+    layers = {
+        LAYER_NAMES[0]: SimpleNamespace(impl=first),
+        LAYER_NAMES[1]: SimpleNamespace(impl=second),
+    }
+    ctx = SimpleNamespace(
+        attn_metadata={"group": _metadata([[3, 1]], [1])},
+        no_compile_layers=layers,
+    )
+    with pytest.raises(RuntimeError, match="injected hook installation failure"):
+        worker.prepare_forward(ctx, [_state("td", "a", resident=8)])
+
+    assert first.forward is forward
+    assert second.forward is forward
+    assert worker._query_hook_originals == {}
+    assert worker._seq_lens is None
+    assert worker._query_observation_indices is None

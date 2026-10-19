@@ -59,23 +59,21 @@ def _state(
     resident: int,
     *,
     override: bool,
-    num_new_tokens: int,
 ):
     return SimpleNamespace(
         request_id=request_id,
         resident_kv_tokens=resident,
         physical_block_ids=[7, 8, 9] if override else None,
-        num_new_tokens=num_new_tokens,
         worker_row=-1,
     )
 
 
 def test_find_token_drop_requests_through_nested_connector_metadata() -> None:
-    requests = [_state("req", 9, override=True, num_new_tokens=1)]
+    requests = [_state("req", 9, override=True)]
     metadata = SimpleNamespace(
         metadata=[
-            SimpleNamespace(other=True),
-            SimpleNamespace(token_drop_requests=requests),
+            SimpleNamespace(token_drop_requests=[]),
+            SimpleNamespace(metadata=[SimpleNamespace(token_drop_requests=requests)]),
         ]
     )
 
@@ -87,7 +85,7 @@ def test_prepare_inputs_mixed_batch_overrides_only_token_drop_row() -> None:
         ["normal-a", "td", "normal-c"],
         [100, 104, 20],
     )
-    states = [_state("td", 33, override=True, num_new_tokens=1)]
+    states = [_state("td", 33, override=True)]
     scheduler_output = SimpleNamespace(
         kv_connector_metadata=SimpleNamespace(token_drop_requests=states)
     )
@@ -107,7 +105,7 @@ def test_prepare_inputs_mixed_batch_overrides_only_token_drop_row() -> None:
             torch.tensor([0, 1, 2, 4], dtype=torch.int32),
             logical_positions,
         )
-        runner.seq_lens[:3] = torch.tensor([101, 105, 22], dtype=torch.int32)
+        runner.seq_lens[:3] = torch.tensor([999, 105, 888], dtype=torch.int32)
         return "prepared"
 
     result = _prepare_inputs_with_physical_frontier(
@@ -124,13 +122,13 @@ def test_prepare_inputs_mixed_batch_overrides_only_token_drop_row() -> None:
         torch.tensor([100, 32, 20, 21], dtype=torch.int64, device="cuda"),
     )
     assert torch.equal(logical_positions, torch.tensor([100, 104, 20, 21]))
-    assert torch.equal(runner.seq_lens[:3], torch.tensor([101, 33, 22], device="cuda"))
+    assert torch.equal(runner.seq_lens[:3], torch.tensor([999, 33, 888], device="cuda"))
     assert runner.input_batch.block_table.rows == {1: ([7, 8, 9],)}
 
 
 def test_prepare_inputs_without_physical_override_is_exact_vanilla() -> None:
     runner = _FakeRunner(["normal", "td"], [104, 40])
-    states = [_state("td", 42, override=False, num_new_tokens=2)]
+    states = [_state("td", 42, override=False)]
     scheduler_output = SimpleNamespace(
         kv_connector_metadata=SimpleNamespace(token_drop_requests=states)
     )
@@ -159,7 +157,7 @@ def test_prepare_inputs_rejects_token_drop_request_absent_from_worker_batch() ->
     runner = _FakeRunner(["req-a", "req-b"], [32, 32])
     scheduler_output = SimpleNamespace(
         kv_connector_metadata=SimpleNamespace(
-            token_drop_requests=[_state("missing", 33, override=True, num_new_tokens=1)]
+            token_drop_requests=[_state("missing", 33, override=True)]
         )
     )
 
@@ -205,3 +203,67 @@ def test_install_worker_adaptor_is_idempotent_for_pinned_vllm() -> None:
     finally:
         GPUModelRunner._prepare_inputs = original_prepare
         MultiGroupBlockTable.compute_slot_mapping = original_slot_mapping
+
+
+def test_slot_mapping_override_is_cleared_after_prepare_failure() -> None:
+    runner = _FakeRunner(["normal", "td"], [10, 104])
+    states = [_state("td", 33, override=True)]
+    output = SimpleNamespace(
+        kv_connector_metadata=SimpleNamespace(token_drop_requests=states)
+    )
+    scheduled = np.array([1, 1], dtype=np.int32)
+    positions = torch.tensor([10, 104], dtype=torch.int64)
+    captured = []
+
+    def record_slot_mapping(_table, _num_reqs, _starts, mapped_positions):
+        captured.append(mapped_positions.clone())
+
+    def failing_prepare(_runner, _output, _scheduled):
+        _compute_slot_mapping_with_physical_positions(
+            record_slot_mapping,
+            runner.input_batch.block_table,
+            2,
+            torch.tensor([0, 1, 2], dtype=torch.int32),
+            positions,
+        )
+        raise RuntimeError("injected prepare failure")
+
+    with pytest.raises(RuntimeError, match="injected prepare failure"):
+        _prepare_inputs_with_physical_frontier(
+            failing_prepare, runner, output, scheduled
+        )
+
+    _compute_slot_mapping_with_physical_positions(
+        record_slot_mapping,
+        runner.input_batch.block_table,
+        2,
+        torch.tensor([0, 1, 2], dtype=torch.int32),
+        positions,
+    )
+    assert torch.equal(captured[0], torch.tensor([10, 32], device="cuda"))
+    assert torch.equal(captured[1], positions)
+
+
+def test_worker_row_assignment_does_not_reorder_connector_metadata() -> None:
+    runner = _FakeRunner(["td-b", "normal", "td-a"], [80, 10, 100])
+    states = [
+        _state("td-a", 101, override=False),
+        _state("td-b", 21, override=True),
+    ]
+    output = SimpleNamespace(
+        kv_connector_metadata=SimpleNamespace(token_drop_requests=states)
+    )
+
+    def original_prepare(runner, _output, _scheduled):
+        runner.seq_lens[:3] = torch.tensor([81, 11, 101], device="cuda")
+        return "prepared"
+
+    assert (
+        _prepare_inputs_with_physical_frontier(
+            original_prepare, runner, output, np.array([1, 1, 1])
+        )
+        == "prepared"
+    )
+    assert [state.request_id for state in states] == ["td-a", "td-b"]
+    assert [state.worker_row for state in states] == [2, 0]
+    assert torch.equal(runner.seq_lens[:3], torch.tensor([21, 11, 101], device="cuda"))

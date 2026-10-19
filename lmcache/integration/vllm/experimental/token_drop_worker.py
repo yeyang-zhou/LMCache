@@ -36,7 +36,6 @@ class TokenDropWorker:
     def __init__(self) -> None:
         self._request_algorithms: dict[str, Any] = {}
         self._kv_caches: dict[str, torch.Tensor] = {}
-        self._layer_names: list[str] = []
         self._block_size = 0
         self._kv_caches_validated = False
 
@@ -75,7 +74,6 @@ class TokenDropWorker:
         # Registration is shared with normal LMCache serving. Validate the
         # token-drop runtime requirements only after a request opts in.
         self._kv_caches = dict(kv_caches)
-        self._layer_names = list(kv_caches)
         self._block_size = 0
         self._kv_caches_validated = False
 
@@ -110,9 +108,11 @@ class TokenDropWorker:
         forward_context: ForwardContext,
         request_states: list[LMCacheMPTokenDropRequestState],
     ) -> None:
+        # An earlier step must never leave attention hooks or observations
+        # active while preparing a new (possibly normal) batch.
+        remove_query_hooks(self)
+        self._clear_step()
         if not request_states:
-            remove_query_hooks(self)
-            self._clear_step()
             return
 
         self._ensure_kv_caches_compatible()
@@ -136,8 +136,6 @@ class TokenDropWorker:
             )
 
         if not any(observe_counts) and not any(compact_now):
-            remove_query_hooks(self)
-            self._clear_step()
             return
 
         attn_metadata = forward_context.attn_metadata
@@ -148,20 +146,22 @@ class TokenDropWorker:
             "FlashAttentionMetadata", next(iter(attn_metadata.values()))
         )
         request_rows = [int(state.worker_row) for state in ordered_states]
-        if any(observe_counts):
-            install_query_hooks(self, forward_context.no_compile_layers)
-        else:
+        try:
+            self.begin_step(
+                [state.request_id for state in ordered_states],
+                representative,
+                physical_seq_lens=physical_seq_lens,
+                request_rows=request_rows,
+                observe_counts=observe_counts,
+                compact_now=compact_now,
+                num_new_tokens=query_lens,
+            )
+            if any(observe_counts):
+                install_query_hooks(self, forward_context.no_compile_layers)
+        except Exception:
             remove_query_hooks(self)
-
-        self.begin_step(
-            [state.request_id for state in ordered_states],
-            representative,
-            physical_seq_lens=physical_seq_lens,
-            request_rows=request_rows,
-            observe_counts=observe_counts,
-            compact_now=compact_now,
-            num_new_tokens=query_lens,
-        )
+            self._clear_step()
+            raise
 
     def begin_step(
         self,
@@ -264,7 +264,7 @@ class TokenDropWorker:
 
     def _flush_query_observations(self) -> None:
         if self._query_observation_slices and set(self._observed_queries) != set(
-            self._layer_names
+            self._kv_caches
         ):
             # No KV writes or algorithm history updates yet. Skip this step
             # rather than letting incomplete Q history corrupt selection.
@@ -299,7 +299,7 @@ class TokenDropWorker:
 
     def _slots_for_request(self, row: int, seq_len: int) -> torch.Tensor:
         assert self._block_table is not None
-        device = self._kv_caches[self._layer_names[0]].device
+        device = next(iter(self._kv_caches.values())).device
         positions = torch.arange(seq_len, device=device)
         block_ids = self._block_table[row, positions // self._block_size].long()
         return block_ids * self._block_size + positions % self._block_size
@@ -313,8 +313,8 @@ class TokenDropWorker:
         """Validate every layer before any destructive GPU KV write."""
         slots = self._slots_for_request(worker_row, seq_len)
         views = {
-            name: PagedKVSequenceView(self._kv_caches[name], slots)
-            for name in self._layer_names
+            name: PagedKVSequenceView(cache, slots)
+            for name, cache in self._kv_caches.items()
         }
         # Algorithm failures at this stage leave original KV untouched.
         try:
@@ -326,13 +326,13 @@ class TokenDropWorker:
             return None
 
         if not isinstance(kept_by_layer, Mapping) or set(kept_by_layer) != set(
-            self._layer_names
+            self._kv_caches
         ):
             logger.warning("Skipping token-drop compaction: invalid layer selection")
             return None
 
         kept_len: int | None = None
-        for name in self._layer_names:
+        for name in self._kv_caches:
             indices = kept_by_layer[name]
             kv_heads = int(self._kv_caches[name].shape[3])
             if (
